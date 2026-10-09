@@ -2038,11 +2038,28 @@ where
             }
         }
 
-        // Stock In (reason Sale-return) for tracked lines. The movement
-        // carries the cancelling request's actor, like its refund Expense.
+        // ---- THE WRITE UNIT -------------------------------------------------
+        //
+        // Everything from here to the COMMIT is ONE transaction: the stock coming
+        // back, one refund DELIVERY per paid amount, the legacy links and the
+        // cancellation itself.
+        //
+        // **This is what T3d fixed, and the direction of the leak is the reason it
+        // matters more than it looks.** Before, the stock came back and each refund
+        // was posted by `create_with_reference` — a unit of ITS OWN — and only then was
+        // the sale flipped to Cancelled. A failure in between left the money actually
+        // refunded and the document still showing Confirmed: the operator sees a live
+        // debt that has already been paid out. The pre-checks above (the aggregate
+        // refund guard, the product checks) are still where they were, on purpose:
+        // they buy an early refusal with a useful message rather than reachability.
+        let mut tx = self.sales.pool().begin().await?;
+
+        // 1. Stock In (reason Sale-return) for tracked lines. The movement carries the
+        // cancelling request's actor, like its refund Expense.
         for line in &tracked {
             self.inventory
-                .record_movement(
+                .record_movement_in(
+                    &mut tx,
                     actor,
                     NewMovement {
                         product_id: line.product_id,
@@ -2056,30 +2073,54 @@ where
                 .await?;
         }
 
-        // Refund Expense per paid amount to originating accounts, each linked
-        // back from the payment row it refunds.
+        // 2. One refund DELIVERY per paid amount, to the account the money came in
+        // through (decision 9). A refund is a payment with `direction='Out'` that
+        // REPLAYS the parent payment's account — which is why it must read the
+        // historical account off the payment row and never re-derive it from the
+        // method, whose owner may have moved since.
+        //
+        // One delivery per parent payment rather than one for the whole annulment,
+        // because the refunds can land in DIFFERENT accounts: two payments into two
+        // boxes have to come back out of their own boxes, and a single delivery has one
+        // account.
         for pay in &payments {
-            let refund = self
-                .transactions
-                .create_with_reference(
+            let refund_delivery = self
+                .record_delivery_in(
+                    &mut tx,
                     actor,
+                    crate::models::PaymentDirection::Out,
+                    crate::models::PartyType::Customer,
+                    sale.customer_id,
+                    pay.method_id,
                     pay.account_id,
-                    crate::models::TransactionKind::Expense,
                     pay.amount,
-                    Some(sale_number.clone()),
-                    Some(sale_number.clone()),
                     sale.sale_date,
+                    Some(format!("cancellation of {sale_number}")),
+                    Some(sale_number.clone()),
+                    None,
+                    // The refund does not APPLY money to a document; it takes money
+                    // back out. An allocation is what covers a debt, so there is none:
+                    // the sale itself is being annulled, not paid.
+                    &[],
                 )
                 .await?;
+            let refund_id = refund_delivery
+                .transaction_id
+                .ok_or_else(|| AppError::Internal("refund delivery has no movement".into()))?;
             self.sales
-                .set_payment_refund_transaction(actor, pay.id, refund.id)
+                .set_payment_refund_transaction_in(&mut tx, actor, pay.id, refund_id)
                 .await?;
         }
 
+        // 3. The document stops being Confirmed. In the same unit as the money leaving.
         let cancelled = self
             .sales
-            .set_cancelled(sale_id, actor, reason.as_deref())
+            .set_cancelled_in(&mut tx, sale_id, actor, reason.as_deref())
             .await?;
+
+        tx.commit().await?;
+
+        // AFTER THE COMMIT, DELIBERATELY: `detail_for` reads through the pool.
         self.detail_for(cancelled).await
     }
 
@@ -3809,6 +3850,180 @@ mod tests {
         assert_eq!(d.paid, Decimal::ZERO);
     }
 
+    /// **THE test for T3d: the leak went the dangerous way.**
+    ///
+    /// Before T3d a cancellation returned the stock and posted each refund with
+    /// `create_with_reference` — a unit of its OWN — and only then flipped the sale to
+    /// Cancelled. A failure in between left the money actually refunded and the
+    /// document still Confirmed: the operator sees a live debt that has already been
+    /// paid out, and nothing reconciles the two.
+    ///
+    /// The failure is injected on the CANCELLATION UPDATE, which is the last write of
+    /// the unit, so every refund is already on the connection when it fires.
+    #[tokio::test]
+    async fn a_failure_while_cancelling_rolls_the_refunds_and_the_stock_back() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "T3D-ATOMIC", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "t3d-atomic").await;
+        let cash = own_method(&s, acc.id, "Cash").await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: CREDIT_CUSTOMER_ID,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap(); // total 20
+        s.confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap();
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("20"), sale_date())
+            .await
+            .unwrap();
+
+        let stock_before = s.inventory.stock_for_decision(prod.id).await.unwrap();
+        let tx_before = tx_count(&pool).await;
+
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_cancel_failure BEFORE UPDATE ON sales \
+             WHEN NEW.status = 'Cancelled' \
+             BEGIN SELECT RAISE(ABORT, 'injected failure after the refunds'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .cancel(audit_actor(&s).await, sale.id, Some("injected".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+
+        // NOTHING survived: the refund did not leave, the goods did not come back, no
+        // delivery was born and the sale is still Confirmed.
+        assert_eq!(
+            tx_count(&pool).await,
+            tx_before,
+            "the refund movement must die with the unit"
+        );
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            stock_before,
+            "and the goods must not have come back either"
+        );
+        let out_deliveries: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE direction = 'Out'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(out_deliveries, 0, "no refund document exists");
+        let refunds: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sale_payments WHERE refund_transaction_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(refunds, 0, "and no legacy row claims one");
+        assert_eq!(
+            s.sales.find_sale(sale.id).await.unwrap().unwrap().status,
+            crate::models::SaleStatus::Confirmed,
+            "the sale is still live: the refusal was a refusal, not a half annulment"
+        );
+    }
+
+    /// A successful cancellation writes the refund as an `Out` delivery that REPLAYS
+    /// the parent payment's account, and the ledger records the reversal.
+    #[tokio::test]
+    async fn a_cancellation_writes_an_out_delivery_replaying_the_parents_account() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "T3D-SHAPE", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "t3d-shape").await;
+        let cash = own_method(&s, acc.id, "Cash").await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: CREDIT_CUSTOMER_ID,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap();
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("20"), sale_date())
+            .await
+            .unwrap();
+
+        s.cancel(audit_actor(&s).await, sale.id, Some("shape".into()))
+            .await
+            .unwrap();
+
+        // The Out delivery: same account, same amount as what came in.
+        let out: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT direction, amount, party_id, account_id FROM payments \
+              WHERE direction = 'Out' ORDER BY id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(out.0, "Out");
+        assert_eq!(out.1, "20");
+        assert_eq!(out.2, CREDIT_CUSTOMER_ID);
+        assert_eq!(
+            out.3, acc.id,
+            "the money goes back out of the box it came into"
+        );
+
+        // Its movement is the sale's reversal and carries the delivery number.
+        let movement: (String, String) = sqlx::query_as(
+            "SELECT t.kind, t.amount FROM transactions t JOIN payments p ON p.transaction_id = t.id \
+              WHERE p.direction = 'Out'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(movement, ("Expense".to_string(), "20".to_string()));
+
+        // And the ledger: the charge, the payment, and the refund that cancels both.
+        let entries: Vec<(String, String)> =
+            sqlx::query_as("SELECT kind, amount FROM party_ledger_entries ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                ("Charge".to_string(), "20".to_string()),
+                ("Payment".to_string(), "-20".to_string()),
+                ("Refund".to_string(), "20".to_string()),
+            ],
+            "a cancellation reverses: charge, payment, refund"
+        );
+    }
+
     // -- P3: the delivery of money is one unit -----------------------------------
 
     /// **THE test for P3a: the live atomicity defect.**
@@ -4329,7 +4544,27 @@ mod tests {
         let refund = rows.iter().find(|t| t.id == refund_id).unwrap();
         assert_eq!(refund.kind, crate::models::TransactionKind::Expense);
         assert_eq!(refund.amount, dec("15"));
-        assert_eq!(refund.reference.as_deref(), Some(number.as_str()));
+        // T3d: the refund is a DELIVERY of money going out, so its movement is stamped
+        // with the delivery's own number — a different document from the sale's, and
+        // that is the point: the money leaving is its own citable fact.
+        assert!(
+            refund
+                .reference
+                .as_deref()
+                .map(|r| r.contains("-PAY-"))
+                .unwrap_or(false),
+            "got {:?}",
+            refund.reference
+        );
+        assert_ne!(refund.reference.as_deref(), Some(number.as_str()));
+        // And the delivery exists as a document with `direction = 'Out'`.
+        let out: (String, String) =
+            sqlx::query_as("SELECT direction, amount FROM payments WHERE transaction_id = ?")
+                .bind(refund_id)
+                .fetch_one(s.sales.pool())
+                .await
+                .unwrap();
+        assert_eq!(out, ("Out".to_string(), "15".to_string()));
     }
 
     #[tokio::test]

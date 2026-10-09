@@ -1890,7 +1890,12 @@ async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
         .expect("refund row");
     assert_eq!(refund["kind"], json!("Expense"));
     assert_eq!(dec(&refund["amount"]), Decimal::from(30));
-    assert_eq!(refund["reference"].as_str(), Some(sale_number.as_str()));
+    // T3d: the refund is an `Out` DELIVERY, so its movement carries that delivery's
+    // number and not the sale's. The sale is what it reverses; the money leaving is its
+    // own citable document.
+    let refund_reference = refund["reference"].as_str().expect("a reference");
+    assert!(refund_reference.contains("-PAY-"), "got {refund_reference}");
+    assert_ne!(refund_reference, sale_number.as_str());
     let original = txs
         .iter()
         .find(|t| t["id"].as_i64() == Some(original_tx))

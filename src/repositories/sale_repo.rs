@@ -409,6 +409,27 @@ pub trait SaleRepository: Send + Sync {
         payment_id: i64,
         refund_transaction_id: i64,
     ) -> AppResult<SalePayment>;
+    /// [`Self::set_payment_refund_transaction`] inside a transaction the CALLER owns.
+    ///
+    /// T3d needs it: a cancellation writes the `Expense`, links it here and flips the
+    /// document to Cancelled, and those three must be ONE unit — otherwise a failure
+    /// between the refund and the cancellation leaves the money gone and the sale still
+    /// Confirmed, which is the defect this whole family of work exists to close.
+    async fn set_payment_refund_transaction_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        payment_id: i64,
+        refund_transaction_id: i64,
+    ) -> AppResult<SalePayment>;
+    /// [`Self::set_cancelled`] inside a transaction the CALLER owns. Same reason.
+    async fn set_cancelled_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+        actor: i64,
+        reason: Option<&str>,
+    ) -> AppResult<Sale>;
     async fn list_payments(&self, sale_id: i64) -> AppResult<Vec<SalePayment>>;
     /// One payment by id — the documents drawer's per-payment read. `None`
     /// for an id that does not exist; the service decides what that means.
@@ -989,7 +1010,21 @@ impl SaleRepository for SqliteSaleRepository {
             .ok_or_else(|| AppError::NotFound(format!("sale {id} not found")))
     }
 
+    /// A transaction of its own, for a caller with no larger unit to offer.
     async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Sale> {
+        let mut tx = self.pool.begin().await?;
+        let cancelled = self.set_cancelled_in(&mut tx, id, actor, reason).await?;
+        tx.commit().await?;
+        Ok(cancelled)
+    }
+
+    async fn set_cancelled_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+        actor: i64,
+        reason: Option<&str>,
+    ) -> AppResult<Sale> {
         let clean = reason.and_then(|s| {
             let t = s.trim();
             if t.is_empty() {
@@ -1009,7 +1044,7 @@ impl SaleRepository for SqliteSaleRepository {
         .bind(clean)
         .bind(actor)
         .bind(id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_sale(row))
@@ -1230,8 +1265,25 @@ impl SaleRepository for SqliteSaleRepository {
         Ok(row_to_payment(row))
     }
 
+    /// A transaction of its own, for a caller with no larger unit to offer. The SQL
+    /// lives in the `_in` form; this only adds the BEGIN/COMMIT.
     async fn set_payment_refund_transaction(
         &self,
+        actor: i64,
+        payment_id: i64,
+        refund_transaction_id: i64,
+    ) -> AppResult<SalePayment> {
+        let mut tx = self.pool.begin().await?;
+        let linked = self
+            .set_payment_refund_transaction_in(&mut tx, actor, payment_id, refund_transaction_id)
+            .await?;
+        tx.commit().await?;
+        Ok(linked)
+    }
+
+    async fn set_payment_refund_transaction_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
         actor: i64,
         payment_id: i64,
         refund_transaction_id: i64,
@@ -1246,7 +1298,7 @@ impl SaleRepository for SqliteSaleRepository {
         .bind(refund_transaction_id)
         .bind(actor)
         .bind(payment_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_payment(row))
