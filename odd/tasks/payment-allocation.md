@@ -783,6 +783,41 @@ decisions.
   third decision closed the wall a Confirmed credit note hit: it is corrected by
   REASSIGNING money, not by annulling it. Nothing was implemented; the two stacked
   branches (`feat/party-ledger-p5`/`-p6`) were dropped for one PR on `feat/party-ledger`.
+- 2026-10-09 — **P5.1 and P5.2a landed** (commits `6c4ea0f` and the batch read). The
+  residual now has ONE definition: the batch form (`residuals_for_documents`, three
+  queries for N documents, non-empty input) and the single-document form both go through
+  the same arithmetic, so a set caller and a one-document caller cannot disagree. Two
+  corrections were needed along the way and both are worth keeping in mind:
+  (1) the repo summed `qty * price + tax` per line UNROUNDED while
+  `SalesService::tax_split` rounds each line through `line_taxes::tax_inclusive_total`;
+  they diverge for any line whose product is not already at 2dp (`0.333 x 3` twice is
+  `2.00` one way and `1.998` the other), and that divergence is exactly what
+  `balance == residuals + unapplied` forbids. The helper import is the precedent set by
+  `party_ledger_repo.rs:14`. (2) `cargo check` sits at **80 bin / 55 test**, one above the
+  79 baseline, and that one warning is EXPECTED AND CORRECT: `allocated_to_target_raw` is
+  reported as never used because its only caller is the `allocated_to_target` trait
+  method, which itself has no production caller yet — the tests reach it, which keeps it
+  out of the bin's dead-code analysis only in the test target. This is the transitive
+  dead-code shape `AGENTS.md` describes: the count will drop when P5.2b wires the read
+  sites to this layer, and that drop is the EVIDENCE the wiring is real. Do NOT silence
+  it with `allow(dead_code)` and do NOT delete the helper: deleting it breaks
+  `allocated_to_target`, which P6 needs.
+
+## Resume here
+  code was written.** Exploration measured that the ledger, though written by every
+  path, did not close `balance == Σ residuals + unapplied` (no production path wrote
+  `PartyEntryKind::Cancel`; the sales-cancel refund wrote no entry while its
+  purchase-cancel mirror wrote one; an applied credit is deliberately invisible to the
+  journal; the legacy rows were still written on purpose). A first revision of "P5
+  blocker" blamed the SIGN of `Refund` and was WRONG — the correction is recorded in
+  place, because the wrong version is the one a future reader re-derives. The user then
+  (a) deleted the legacy dual-write outright instead of retiring it in P8, since the dev
+  database is wiped, and (b) retired `cancel` as a business action entirely, a Confirmed
+  document being corrected with a mirror document. Together those removed the journal
+  blocker, so P5 is one task again and `cancel`'s retirement is a separate feature. A
+  third decision closed the wall a Confirmed credit note hit: it is corrected by
+  REASSIGNING money, not by annulling it. Nothing was implemented; the two stacked
+  branches (`feat/party-ledger-p5`/`-p6`) were dropped for one PR on `feat/party-ledger`.
 
 ## Resume here
 

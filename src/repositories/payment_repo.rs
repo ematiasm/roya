@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use rust_decimal::Decimal;
-use sqlx::{Row, SqliteConnection, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 
 use crate::error::{AppError, AppResult};
 use crate::models::{
@@ -8,6 +8,7 @@ use crate::models::{
 };
 use crate::repositories::checked_aggregate_sum;
 use crate::services::checked_money_sum;
+use crate::services::line_taxes::tax_inclusive_total;
 
 /// One document per DELIVERY of money, plus the shares that say which documents
 /// it covers (migration 46).
@@ -104,6 +105,24 @@ pub trait PaymentRepository: Send + Sync {
         target_id: i64,
     ) -> AppResult<Decimal>;
 
+    /// Return every component needed by document folds, including statements.
+    /// The parts are retained rather than only their residual because a statement
+    /// presents charge, returns, and allocations separately. The pool form wraps
+    /// the caller-owned form; `_in` is available to reads participating in a
+    /// caller's unit and sees its uncommitted document, return, and allocation rows.
+    async fn residuals_for_documents(
+        &self,
+        target_kind: PartyDocumentKind,
+        target_ids: &[i64],
+    ) -> AppResult<std::collections::BTreeMap<i64, DocumentResidualParts>>;
+
+    async fn residuals_for_documents_in(
+        &self,
+        tx: &mut SqliteConnection,
+        target_kind: PartyDocumentKind,
+        target_ids: &[i64],
+    ) -> AppResult<std::collections::BTreeMap<i64, DocumentResidualParts>>;
+
     /// Caller-owned connection form: the allocation cap must see uncommitted rows.
     async fn residual_for_document_in(
         &self,
@@ -126,6 +145,16 @@ pub trait PaymentRepository: Send + Sync {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// The auditable components of one Sale or Purchase's remaining balance.
+/// `signed_returns` is already signed as stored in the party journal.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocumentResidualParts {
+    pub charge: Decimal,
+    pub signed_returns: Decimal,
+    pub allocated: Decimal,
+    pub residual: Decimal,
+}
 
 fn parse_decimal(s: &str) -> Decimal {
     Decimal::from_str_exact(s).unwrap_or(Decimal::ZERO)
@@ -311,32 +340,50 @@ async fn assert_within_cap(
     Ok(())
 }
 
-/// The shared document residual used by both reads and the allocation cap.
+/// The shared document residual machinery used by both reads and the allocation cap.
 ///
-/// Document line totals are derived (`qty * price + tax_total`) and summed in Rust,
-/// never in SQL where SQLite would do money arithmetic in REAL. Signed Return ledger
-/// rows linked through the return-family parent reduce the charge; allocations then
-/// reduce it further.
-async fn residual_for_document_in(
+/// Each line is rounded through the tax feature's one tax-inclusive rule, then the
+/// document's line totals are checked together. This mirrors the repository precedent
+/// in `party_ledger_repo.rs`: the service owns the document amount, and SQL must never
+/// sum money stored as TEXT through SQLite REAL arithmetic.
+async fn residuals_for_documents_in(
     tx: &mut SqliteConnection,
     target_kind: PartyDocumentKind,
-    target_id: i64,
-) -> AppResult<Decimal> {
-    // `lines_sql` supplies the one Rust-derived charge total. The linked signed
-    // Return entries below reduce it, and `payment_allocations` supplies the one
-    // attribution fold; the legacy payment tables are deliberately not consulted.
-    let (lines_sql, missing): (&str, AppError) = match target_kind {
+    target_ids: &[i64],
+    query_tick: impl Fn(),
+) -> AppResult<std::collections::BTreeMap<i64, DocumentResidualParts>> {
+    use std::collections::BTreeMap;
+
+    if target_ids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let (
+        document_table,
+        line_table,
+        parent_column,
+        price_column,
+        return_table,
+        return_column,
+        allocation_kind,
+    ) = match target_kind {
         PartyDocumentKind::Sale => (
-            "SELECT qty, unit_price, tax_total FROM sale_lines WHERE sale_id = ? ORDER BY id",
-            AppError::NotFound(format!("sale {target_id} not found")),
+            "sales",
+            "sale_lines",
+            "sale_id",
+            "unit_price",
+            "customer_returns",
+            "sale_id",
+            "Sale",
         ),
         PartyDocumentKind::Purchase => (
-            "SELECT qty, unit_cost, tax_total FROM purchase_lines WHERE purchase_id = ? ORDER BY id",
-            AppError::NotFound(format!("purchase {target_id} not found")),
+            "purchases",
+            "purchase_lines",
+            "purchase_id",
+            "unit_cost",
+            "purchase_returns",
+            "purchase_id",
+            "Purchase",
         ),
-        // A return family is not something money is APPLIED to: a refund replays a
-        // parent payment and a credit note reduces a sale. Allocating to one would be
-        // a new concept, so it is refused rather than guessed at.
         PartyDocumentKind::CustomerReturn | PartyDocumentKind::PurchaseReturn => {
             return Err(AppError::Validation(format!(
                 "money cannot be applied to a {target_kind} document: returns reduce their parent, they are not collected against"
@@ -344,57 +391,147 @@ async fn residual_for_document_in(
         }
     };
 
-    let lines: Vec<(String, String, String)> = sqlx::query_as(sqlx::AssertSqlSafe(lines_sql))
-        .bind(target_id)
-        .fetch_all(&mut *tx)
-        .await?;
-    let mut total = Decimal::ZERO;
-    for (qty, price, tax) in &lines {
-        let line = parse_decimal(qty) * parse_decimal(price);
-        let line =
-            checked_money_sum([line, parse_decimal(tax)].iter()).map_err(AppError::PriceRefused)?;
-        total = checked_money_sum([total, line].iter()).map_err(AppError::PriceRefused)?;
+    // The parent LEFT JOIN both reads every requested document and distinguishes a
+    // valid zero-line document from an unknown id, without spending a fourth query.
+    let mut lines_qb: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+        "SELECT d.id AS document_id, l.qty, l.{price_column} AS unit_price, l.tax_total \
+         FROM {document_table} d LEFT JOIN {line_table} l ON l.{parent_column} = d.id \
+         WHERE d.id IN ("
+    ));
+    {
+        let mut separated = lines_qb.separated(", ");
+        for id in target_ids {
+            separated.push_bind(*id);
+        }
+        separated.push_unseparated(") ORDER BY d.id, l.id");
     }
-    // An empty line set means either a document with no lines (legitimate on a Draft,
-    // and its total is then zero) or a document that does not exist. The parent read
-    // is what tells them apart, and only that one is an error.
-    if lines.is_empty() && !document_exists(tx, target_kind, target_id).await? {
-        return Err(missing);
+    let line_rows = lines_qb.build().fetch_all(&mut *tx).await?;
+    query_tick();
+    let mut totals: BTreeMap<i64, Vec<Decimal>> = BTreeMap::new();
+    let mut found = BTreeMap::new();
+    for row in line_rows {
+        let document_id: i64 = row.try_get("document_id")?;
+        found.insert(document_id, ());
+        let qty: Option<String> = row.try_get("qty")?;
+        if let Some(qty) = qty {
+            let price: String = row.try_get("unit_price")?;
+            let tax: String = row.try_get("tax_total")?;
+            let net = parse_decimal(&qty) * parse_decimal(&price);
+            totals
+                .entry(document_id)
+                .or_default()
+                .push(tax_inclusive_total(net, parse_decimal(&tax)));
+        }
+    }
+    for id in target_ids {
+        if !found.contains_key(id) {
+            let name = if target_kind == PartyDocumentKind::Sale {
+                "sale"
+            } else {
+                "purchase"
+            };
+            return Err(AppError::NotFound(format!("{name} {id} not found")));
+        }
+    }
+    let mut parts = BTreeMap::new();
+    for id in target_ids {
+        let charge = checked_money_sum(totals.get(id).into_iter().flatten())
+            .map_err(AppError::PriceRefused)?;
+        parts.insert(
+            *id,
+            DocumentResidualParts {
+                charge,
+                signed_returns: Decimal::ZERO,
+                allocated: Decimal::ZERO,
+                residual: Decimal::ZERO,
+            },
+        );
     }
 
-    let (returns_sql, allocation_kind) = match target_kind {
-        PartyDocumentKind::Sale => (
-            "SELECT e.amount FROM party_ledger_entries e \
-             JOIN customer_returns r ON r.id = e.document_id \
-             WHERE e.kind = 'Return' AND e.document_kind = 'CustomerReturn' AND r.sale_id = ? \
-             ORDER BY e.id",
-            "Sale",
-        ),
-        PartyDocumentKind::Purchase => (
-            "SELECT e.amount FROM party_ledger_entries e \
-             JOIN purchase_returns r ON r.id = e.document_id \
-             WHERE e.kind = 'Return' AND e.document_kind = 'PurchaseReturn' AND r.purchase_id = ? \
-             ORDER BY e.id",
-            "Purchase",
-        ),
+    let mut returns_qb: QueryBuilder<Sqlite> = QueryBuilder::new(format!(
+        "SELECT r.{return_column} AS target_id, e.amount FROM party_ledger_entries e \
+         JOIN {return_table} r ON r.id = e.document_id \
+         WHERE e.kind = 'Return' AND e.document_kind = "
+    ));
+    returns_qb
+        .push_bind(target_kind_return_name(target_kind))
+        .push(format!(" AND r.{return_column} IN ("));
+    {
+        let mut separated = returns_qb.separated(", ");
+        for id in target_ids {
+            separated.push_bind(*id);
+        }
+        separated.push_unseparated(") ORDER BY e.id");
+    }
+    let return_rows = returns_qb.build().fetch_all(&mut *tx).await?;
+    query_tick();
+    let mut returns_by_target: BTreeMap<i64, Vec<Decimal>> = BTreeMap::new();
+    for row in return_rows {
+        let target_id: i64 = row.try_get("target_id")?;
+        let amount: String = row.try_get("amount")?;
+        returns_by_target
+            .entry(target_id)
+            .or_default()
+            .push(parse_decimal(&amount));
+    }
+
+    let mut allocations_qb: QueryBuilder<Sqlite> =
+        QueryBuilder::new("SELECT target_id, amount FROM payment_allocations WHERE target_kind = ");
+    allocations_qb
+        .push_bind(allocation_kind)
+        .push(" AND target_id IN (");
+    {
+        let mut separated = allocations_qb.separated(", ");
+        for id in target_ids {
+            separated.push_bind(*id);
+        }
+        separated.push_unseparated(") ORDER BY id");
+    }
+    let allocation_rows = allocations_qb.build().fetch_all(&mut *tx).await?;
+    query_tick();
+    let mut allocations_by_target: BTreeMap<i64, Vec<Decimal>> = BTreeMap::new();
+    for row in allocation_rows {
+        let target_id: i64 = row.try_get("target_id")?;
+        let amount: String = row.try_get("amount")?;
+        allocations_by_target
+            .entry(target_id)
+            .or_default()
+            .push(parse_decimal(&amount));
+    }
+
+    for (id, item) in &mut parts {
+        item.signed_returns =
+            checked_aggregate_sum(returns_by_target.get(id).into_iter().flatten())
+                .map_err(AppError::PriceRefused)?;
+        item.allocated = checked_aggregate_sum(allocations_by_target.get(id).into_iter().flatten())
+            .map_err(AppError::PriceRefused)?;
+        let after_returns = checked_money_sum([item.charge, item.signed_returns].iter())
+            .map_err(AppError::PriceRefused)?;
+        item.residual = after_returns.checked_sub(item.allocated).ok_or_else(|| {
+            AppError::PriceRefused(crate::models::PriceRefusal::DocumentTotalTooLarge)
+        })?;
+    }
+    Ok(parts)
+}
+
+fn target_kind_return_name(target_kind: PartyDocumentKind) -> &'static str {
+    match target_kind {
+        PartyDocumentKind::Sale => "CustomerReturn",
+        PartyDocumentKind::Purchase => "PurchaseReturn",
         PartyDocumentKind::CustomerReturn | PartyDocumentKind::PurchaseReturn => unreachable!(),
-    };
-    let return_rows: Vec<(String,)> = sqlx::query_as(sqlx::AssertSqlSafe(returns_sql))
-        .bind(target_id)
-        .fetch_all(&mut *tx)
-        .await?;
-    let signed_returns: Vec<Decimal> = return_rows
-        .iter()
-        .map(|(amount,)| parse_decimal(amount))
-        .collect();
-    let returns = checked_aggregate_sum(signed_returns.iter()).map_err(AppError::PriceRefused)?;
-    let charge_after_returns =
-        checked_money_sum([total, returns].iter()).map_err(AppError::PriceRefused)?;
+    }
+}
 
-    let allocated = allocated_to_target_raw(&mut *tx, allocation_kind, target_id).await?;
-    charge_after_returns
-        .checked_sub(allocated)
-        .ok_or_else(|| AppError::PriceRefused(crate::models::PriceRefusal::DocumentTotalTooLarge))
+async fn residual_for_document_in(
+    tx: &mut SqliteConnection,
+    target_kind: PartyDocumentKind,
+    target_id: i64,
+) -> AppResult<Decimal> {
+    residuals_for_documents_in(tx, target_kind, &[target_id], || {})
+        .await?
+        .get(&target_id)
+        .map(|parts| parts.residual)
+        .ok_or_else(|| AppError::Internal("single-document residual missing from batch".into()))
 }
 
 async fn target_residual_due(
@@ -405,26 +542,6 @@ async fn target_residual_due(
     residual_for_document_in(tx, target_kind, target_id).await
 }
 
-/// Does the parent document exist? Asked only when it has no lines, so the ordinary
-/// path pays no extra read.
-async fn document_exists(
-    tx: &mut SqliteConnection,
-    target_kind: PartyDocumentKind,
-    id: i64,
-) -> AppResult<bool> {
-    let sql = match target_kind {
-        PartyDocumentKind::Sale => "SELECT id FROM sales WHERE id = ?",
-        PartyDocumentKind::Purchase => "SELECT id FROM purchases WHERE id = ?",
-        PartyDocumentKind::CustomerReturn => "SELECT id FROM customer_returns WHERE id = ?",
-        PartyDocumentKind::PurchaseReturn => "SELECT id FROM purchase_returns WHERE id = ?",
-    };
-    let found: Option<i64> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
-    Ok(found.is_some())
-}
-
 // ---------------------------------------------------------------------------
 // SQLite implementation
 // ---------------------------------------------------------------------------
@@ -432,11 +549,35 @@ async fn document_exists(
 #[derive(Clone)]
 pub struct SqlitePaymentRepository {
     pub pool: SqlitePool,
+    /// Test-only counter for the batch machinery's actual SQL reads.
+    #[cfg(test)]
+    batch_queries: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl SqlitePaymentRepository {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            #[cfg(test)]
+            batch_queries: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        }
+    }
+
+    #[cfg(test)]
+    fn count_batch_query(&self) {
+        self.batch_queries
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn reset_batch_query_count(&self) {
+        self.batch_queries
+            .store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    fn batch_query_count(&self) -> usize {
+        self.batch_queries.load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -578,6 +719,32 @@ impl PaymentRepository for SqlitePaymentRepository {
         target_id: i64,
     ) -> AppResult<Decimal> {
         allocated_to_target_raw(&self.pool, &target_kind.to_string(), target_id).await
+    }
+
+    async fn residuals_for_documents(
+        &self,
+        target_kind: PartyDocumentKind,
+        target_ids: &[i64],
+    ) -> AppResult<std::collections::BTreeMap<i64, DocumentResidualParts>> {
+        let mut tx = self.pool.begin().await?;
+        let result = self
+            .residuals_for_documents_in(&mut tx, target_kind, target_ids)
+            .await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    async fn residuals_for_documents_in(
+        &self,
+        tx: &mut SqliteConnection,
+        target_kind: PartyDocumentKind,
+        target_ids: &[i64],
+    ) -> AppResult<std::collections::BTreeMap<i64, DocumentResidualParts>> {
+        residuals_for_documents_in(tx, target_kind, target_ids, || {
+            #[cfg(test)]
+            self.count_batch_query();
+        })
+        .await
     }
 
     async fn residual_for_document(
@@ -1316,6 +1483,140 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
         assert!(err.to_string().contains("owes 0"), "got {err}");
+    }
+
+    #[tokio::test]
+    async fn a_document_total_rounds_each_line_like_the_service_does() {
+        let pool = test_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (sale, product) = seed_confirmed_sale(&pool, actor, "2").await;
+        // SQLite stores qty as TEXT and accepts this fractional quantity. Each
+        // 0.333 * 3 line is 0.999, which rounds to 1.00; summing raw products
+        // first would instead produce 1.998 and disagree with the service.
+        sqlx::query("UPDATE sale_lines SET qty = '0.333', unit_price = '3' WHERE sale_id = ?")
+            .bind(sale)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO sale_lines (sale_id, product_id, qty, unit_price, tax_total) \
+             VALUES (?, ?, '0.333', '3', '0')",
+        )
+        .bind(sale)
+        .bind(product)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let repo = SqlitePaymentRepository::new(pool);
+        assert_eq!(
+            repo.residual_for_document(PartyDocumentKind::Sale, sale)
+                .await
+                .unwrap(),
+            Decimal::from_str("2.00").unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn batched_document_parts_equal_each_single_document_residual() {
+        let pool = test_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (first, _) = seed_confirmed_sale(&pool, actor, "100").await;
+        let (second, _) = seed_confirmed_sale(&pool, actor, "80").await;
+        let (third, _) = seed_confirmed_sale(&pool, actor, "50").await;
+        let first_payment = seed_payment(&pool, "10").await;
+        let second_payment = seed_payment(&pool, "20").await;
+        let repo = SqlitePaymentRepository::new(pool.clone());
+        repo.allocate(&allocation(first_payment, first, "10"))
+            .await
+            .unwrap();
+        repo.allocate(&allocation(second_payment, second, "20"))
+            .await
+            .unwrap();
+
+        let customer: i64 = sqlx::query_scalar("SELECT customer_id FROM sales WHERE id = ?")
+            .bind(second)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let returned: i64 = sqlx::query_scalar(
+            "INSERT INTO customer_returns (customer_id, sale_id, status, return_date, created_by) \
+             VALUES (?, ?, 'Confirmed', '2024-05-02', ?) RETURNING id",
+        )
+        .bind(customer)
+        .bind(second)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO party_ledger_entries \
+             (party_type, party_id, kind, amount, document_kind, document_id, entry_date, created_by) \
+             VALUES ('Customer', ?, 'Return', '-7', 'CustomerReturn', ?, '2024-05-02', ?)",
+        )
+        .bind(customer)
+        .bind(returned)
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let ids = [first, second, third];
+        let parts = repo
+            .residuals_for_documents(PartyDocumentKind::Sale, &ids)
+            .await
+            .unwrap();
+        assert_eq!(parts.len(), ids.len());
+        for id in ids {
+            assert_eq!(
+                parts[&id].residual,
+                repo.residual_for_document(PartyDocumentKind::Sale, id)
+                    .await
+                    .unwrap(),
+                "batch and single reads must share the same definition for {id}"
+            );
+        }
+        assert_eq!(parts[&first].charge, Decimal::from_str("100").unwrap());
+        assert_eq!(parts[&first].signed_returns, Decimal::ZERO);
+        assert_eq!(parts[&first].allocated, Decimal::from_str("10").unwrap());
+        assert_eq!(parts[&first].residual, Decimal::from_str("90").unwrap());
+        assert_eq!(parts[&second].charge, Decimal::from_str("80").unwrap());
+        assert_eq!(
+            parts[&second].signed_returns,
+            Decimal::from_str("-7").unwrap()
+        );
+        assert_eq!(parts[&second].allocated, Decimal::from_str("20").unwrap());
+        assert_eq!(parts[&second].residual, Decimal::from_str("53").unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_batch_reads_three_documents_with_three_queries_not_one_query_per_document() {
+        let pool = test_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (first, _) = seed_confirmed_sale(&pool, actor, "10").await;
+        let (second, _) = seed_confirmed_sale(&pool, actor, "20").await;
+        let (third, _) = seed_confirmed_sale(&pool, actor, "30").await;
+        let repo = SqlitePaymentRepository::new(pool);
+        repo.reset_batch_query_count();
+
+        repo.residuals_for_documents(PartyDocumentKind::Sale, &[first, second, third])
+            .await
+            .unwrap();
+        assert_eq!(repo.batch_query_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn an_empty_document_batch_returns_empty_without_querying() {
+        let pool = test_pool().await;
+        let repo = SqlitePaymentRepository::new(pool);
+        repo.reset_batch_query_count();
+
+        assert!(repo
+            .residuals_for_documents(PartyDocumentKind::Sale, &[])
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(repo.batch_query_count(), 0);
     }
 
     #[tokio::test]
