@@ -212,29 +212,31 @@ where
                 )
             })
             .collect();
-        let delivery = self
-            .sales
-            .record_delivery_in(
-                &mut tx,
-                actor,
-                crate::models::PaymentDirection::In,
-                crate::models::PartyType::Customer,
-                customer_id,
-                method_id,
-                account_id,
-                amount,
-                date,
-                // The movement's human label: the customer whose counter this money
-                // crossed, which is what a statement reader needs.
-                None,
-                Some(customer.name.clone()),
-                // The receipt is created in this same unit just above, so the delivery
-                // names it: that is the edge that lets the receipt state how much money
-                // it grouped instead of only what it applied.
-                Some(receipt.id),
-                &allocations,
-            )
-            .await?;
+        let delivery = crate::services::payment_writer::record_delivery_in(
+            &self.sales.sequences,
+            &self.sales.transactions,
+            &self.sales.party_ledger,
+            &self.sales.payments,
+            &mut tx,
+            actor,
+            crate::models::PaymentDirection::In,
+            crate::models::PartyType::Customer,
+            customer_id,
+            method_id,
+            account_id,
+            amount,
+            date,
+            // The movement's human label: the customer whose counter this money
+            // crossed, which is what a statement reader needs.
+            None,
+            Some(customer.name.clone()),
+            // The receipt is created in this same unit just above, so the delivery
+            // names it: that is the edge that lets the receipt state how much money
+            // it grouped instead of only what it applied.
+            Some(receipt.id),
+            &allocations,
+        )
+        .await?;
 
         // The legacy rows stay ONE PER COVERED SALE, because the receipt's own read
         // (`list_payments_by_receipt`) still asks for them and P5 is what moves that

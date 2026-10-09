@@ -2239,7 +2239,11 @@ async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
         .expect("refund row");
     assert_eq!(refund["kind"], json!("Income"));
     assert_eq!(dec(&refund["amount"]), Decimal::from(135));
-    assert_eq!(refund["reference"].as_str(), Some(purchase_number.as_str()));
+    // T3d: the reversal is a DELIVERY, so its movement carries that delivery's number
+    // and the purchase stays the description.
+    let refund_reference = refund["reference"].as_str().expect("a reference");
+    assert!(refund_reference.contains("-PAY-"), "got {refund_reference}");
+    assert_ne!(refund_reference, purchase_number.as_str());
 }
 
 /// Migration 45 removed "a method with no owning account": ownership is a NOT

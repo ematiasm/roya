@@ -85,7 +85,7 @@ pub enum LineAddOutcome {
 }
 
 #[derive(Clone)]
-pub struct PurchasesService<PR, DR, SR, CR, C, P, B, S, A, T, PM, TS, PL>
+pub struct PurchasesService<PR, DR, SR, CR, C, P, B, S, A, T, PM, TS, PL, PY>
 where
     PR: crate::repositories::PurchaseRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -100,6 +100,7 @@ where
     PM: crate::repositories::PaymentMethodRepository,
     TS: crate::repositories::TaxSnapshotRepository,
     PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub purchases: PR,
     pub sequences: DR,
@@ -117,10 +118,13 @@ where
     /// counter, because a payable and a receivable are the same fact with the
     /// party's type deciding which way the balance leans.
     pub party_ledger: PL,
+    /// The `payments` family (T3d): a purchase refund is a delivery of money going
+    /// back IN, so this side needs the same document sales has.
+    pub payments: PY,
 }
 
-impl<PR, DR, SR, CR, C, P, B, S, A, T, PM, TS, PL>
-    PurchasesService<PR, DR, SR, CR, C, P, B, S, A, T, PM, TS, PL>
+impl<PR, DR, SR, CR, C, P, B, S, A, T, PM, TS, PL, PY>
+    PurchasesService<PR, DR, SR, CR, C, P, B, S, A, T, PM, TS, PL, PY>
 where
     PR: crate::repositories::PurchaseRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -135,6 +139,7 @@ where
     PM: crate::repositories::PaymentMethodRepository,
     TS: crate::repositories::TaxSnapshotRepository,
     PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub fn new(
         purchases: PR,
@@ -145,6 +150,7 @@ where
         payment_methods: crate::services::PaymentMethodService<PM>,
         tax_snapshots: TS,
         party_ledger: PL,
+        payments: PY,
     ) -> Self {
         Self {
             purchases,
@@ -155,6 +161,7 @@ where
             payment_methods,
             tax_snapshots,
             party_ledger,
+            payments,
         }
     }
 
@@ -1571,11 +1578,20 @@ where
             }
         }
 
-        // Stock Out (reason Purchase-return) for tracked lines. The movement
-        // carries the cancelling request's actor, like its refund Income.
+        // ---- THE WRITE UNIT -------------------------------------------------
+        //
+        // The mirror of `SalesService::cancel` (T3d), and the same leak in the other
+        // direction of money: before this the stock left and each refund was posted by
+        // `create_with_reference` — a unit of its own — and only then was the purchase
+        // flipped to Cancelled. A failure in between left the money refunded and the
+        // document still Confirmed.
+        let mut tx = self.purchases.pool().begin().await?;
+
+        // 1. Stock Out (reason Purchase-return) for tracked lines.
         for line in &tracked {
             self.inventory
-                .record_movement(
+                .record_movement_in(
+                    &mut tx,
                     actor,
                     NewMovement {
                         product_id: line.product_id,
@@ -1589,31 +1605,49 @@ where
                 .await?;
         }
 
-        // Refund Income per paid amount to the originating accounts. A purchase
-        // refund is money entering: no negative-balance guard applies. Each refund
-        // is linked back from the payment row it refunds.
+        // 2. One refund delivery per paid amount, to the account the money went out of
+        // (decision 9: the refund REPLAYS the parent payment's account). For a purchase
+        // the refund is an `Income` — money coming back — so no negative-balance guard
+        // applies, which is why the pre-checks above only verify the accounts exist.
         for pay in &payments {
-            let refund = self
-                .transactions
-                .create_with_reference(
-                    actor,
-                    pay.account_id,
-                    crate::models::TransactionKind::Income,
-                    pay.amount,
-                    Some(purchase_number.clone()),
-                    Some(purchase_number.clone()),
-                    purchase.purchase_date,
-                )
-                .await?;
+            let refund_delivery = crate::services::payment_writer::record_delivery_in(
+                &self.sequences,
+                &self.transactions,
+                &self.party_ledger,
+                &self.payments,
+                &mut tx,
+                actor,
+                crate::models::PaymentDirection::In,
+                crate::models::PartyType::Supplier,
+                purchase.supplier_id,
+                pay.method_id,
+                pay.account_id,
+                pay.amount,
+                purchase.purchase_date,
+                Some(format!("cancellation of {purchase_number}")),
+                Some(purchase_number.clone()),
+                None,
+                // No allocation: a refund takes money back out of the document being
+                // annulled, it does not cover a debt.
+                &[],
+            )
+            .await?;
+            let refund_id = refund_delivery
+                .transaction_id
+                .ok_or_else(|| AppError::Internal("refund delivery has no movement".into()))?;
             self.purchases
-                .set_payment_refund_transaction(actor, pay.id, refund.id)
+                .set_payment_refund_transaction_in(&mut tx, actor, pay.id, refund_id)
                 .await?;
         }
 
+        // 3. The document stops being Confirmed, in the same unit as the money.
         let cancelled = self
             .purchases
-            .set_cancelled(purchase_id, actor, reason.as_deref())
+            .set_cancelled_in(&mut tx, purchase_id, actor, reason.as_deref())
             .await?;
+
+        tx.commit().await?;
+
         self.detail_for(cancelled).await
     }
 
@@ -1736,7 +1770,10 @@ mod tests {
         SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTaxSnapshotRepository,
         SqliteTransactionRepository, StockMovementRepository, TaxRepository, TransactionRepository,
     };
-    use crate::repositories::{PartyLedgerRepository, SqlitePartyLedgerRepository};
+    use crate::repositories::{
+        PartyLedgerRepository, PaymentRepository, SqlitePartyLedgerRepository,
+        SqlitePaymentRepository,
+    };
     use crate::security::test_support;
     use crate::services::{
         InventoryService, PaymentMethodService, SupplierService, TransactionService,
@@ -1770,6 +1807,7 @@ mod tests {
         SqlitePaymentMethodRepository,
         SqliteTaxSnapshotRepository,
         SqlitePartyLedgerRepository,
+        SqlitePaymentRepository,
     >;
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -1813,6 +1851,7 @@ mod tests {
             PaymentMethodService::new(SqlitePaymentMethodRepository::new(pool.clone())),
             SqliteTaxSnapshotRepository::new(pool.clone()),
             SqlitePartyLedgerRepository::new(pool.clone()),
+            SqlitePaymentRepository::new(pool.clone()),
         );
         (s, pool)
     }
@@ -5030,7 +5069,18 @@ mod tests {
         let refund = rows.iter().find(|t| t.id == refund_id).unwrap();
         assert_eq!(refund.kind, TransactionKind::Income);
         assert_eq!(refund.amount, dec("15"));
-        assert_eq!(refund.reference.as_deref(), Some(number.as_str()));
+        // T3d: the refund is a delivery going back in, so its movement carries that
+        // delivery's number; the purchase stays the description.
+        assert!(
+            refund
+                .reference
+                .as_deref()
+                .map(|r| r.contains("-PAY-"))
+                .unwrap_or(false),
+            "got {:?}",
+            refund.reference
+        );
+        assert_ne!(refund.reference.as_deref(), Some(number.as_str()));
     }
 
     /// N5 follow-up: the purchase filters run in the repository too, so the details

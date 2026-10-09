@@ -64,7 +64,7 @@ struct RefundPlan {
 }
 
 #[derive(Clone)]
-pub struct CustomerReturnService<RR, DR, SR, C, P, B, S, A, T, PL>
+pub struct CustomerReturnService<RR, DR, SR, C, P, B, S, A, T, PL, PY>
 where
     RR: crate::repositories::CustomerReturnRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -76,6 +76,7 @@ where
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
     PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub returns: RR,
     pub sequences: DR,
@@ -87,9 +88,13 @@ where
     /// movement. A refund's own entry is a different event on a different path
     /// (T3b), which is why this field is used for the return and nothing else.
     pub party_ledger: PL,
+    /// The `payments` family (T3d): a cancelled credit note returns the money as a
+    /// delivery going back out/in, so this side needs the same document.
+    pub payments: PY,
 }
 
-impl<RR, DR, SR, C, P, B, S, A, T, PL> CustomerReturnService<RR, DR, SR, C, P, B, S, A, T, PL>
+impl<RR, DR, SR, C, P, B, S, A, T, PL, PY>
+    CustomerReturnService<RR, DR, SR, C, P, B, S, A, T, PL, PY>
 where
     RR: crate::repositories::CustomerReturnRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -101,6 +106,7 @@ where
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
     PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub fn new(
         returns: RR,
@@ -109,6 +115,7 @@ where
         inventory: crate::services::InventoryService<C, P, B, S>,
         transactions: crate::services::TransactionService<A, T>,
         party_ledger: PL,
+        payments: PY,
     ) -> Self {
         Self {
             returns,
@@ -117,6 +124,7 @@ where
             inventory,
             transactions,
             party_ledger,
+            payments,
         }
     }
 
@@ -850,11 +858,24 @@ where
             }
         }
 
+        // ---- THE WRITE UNIT (T3d) -------------------------------------------
+        //
+        // The stock movements, the reversal deliveries and the cancellation are ONE
+        // unit. Before, each reversal was posted by `create_with_reference` — a unit of
+        // its own — and only then was the note flipped to Cancelled, so a failure in
+        // between left the money reversed and the note still Confirmed.
+        //
+        // The unit opens BEFORE the stock, unlike `confirm` where the movement comes
+        // after: here the goods leaving the shelf is the first half of the same
+        // reversal, and a failure after it must take it back.
+        let mut tx = self.returns.pool().begin().await?;
+
         // Stock Out: the goods the customer sent back leave the shelf again. The
         // movement carries the cancelling request's actor, like its reversal.
         for (line, parent) in &tracked {
             self.inventory
-                .record_movement(
+                .record_movement_in(
+                    &mut tx,
                     actor,
                     NewMovement {
                         product_id: parent.product_id,
@@ -868,34 +889,49 @@ where
                 .await?;
         }
 
-        // The money comes back in, per originating account, each reversal linked
-        // back from the refund row it reverses. An Income is money ENTERING, so
-        // no account can be overdrawn by this and the reversal cannot be refused
-        // for want of funds — which is what makes a credit note genuinely
-        // reversible, where a purchase return's reversal can be refused because
-        // the shop has already spent the refund it received.
+        // The money comes back in, per originating account, as a delivery that REPLAYS
+        // the account the refund went out of (decision 9). An `Income` is money
+        // ENTERING, so no account can be overdrawn by this and the reversal cannot be
+        // refused for want of funds — which is what makes a credit note genuinely
+        // reversible, where a purchase return's reversal can be refused because the shop
+        // has already spent the refund it received.
         for pay in &payments {
-            let reversal = self
-                .transactions
-                .create_with_reference(
-                    actor,
-                    pay.account_id,
-                    crate::models::TransactionKind::Income,
-                    pay.amount,
-                    Some(credit_note_number.clone()),
-                    Some(credit_note_number.clone()),
-                    customer_return.return_date,
-                )
-                .await?;
+            let reversal_delivery = crate::services::payment_writer::record_delivery_in(
+                &self.sequences,
+                &self.transactions,
+                &self.party_ledger,
+                &self.payments,
+                &mut tx,
+                actor,
+                crate::models::PaymentDirection::In,
+                crate::models::PartyType::Customer,
+                customer_return.customer_id,
+                pay.method_id,
+                pay.account_id,
+                pay.amount,
+                customer_return.return_date,
+                Some(format!("cancellation of {credit_note_number}")),
+                Some(credit_note_number.clone()),
+                None,
+                // No allocation: this reverses a document, it does not cover a debt.
+                &[],
+            )
+            .await?;
+            let reversal_id = reversal_delivery
+                .transaction_id
+                .ok_or_else(|| AppError::Internal("reversal delivery has no movement".into()))?;
             self.returns
-                .set_payment_refund_transaction(actor, pay.id, reversal.id)
+                .set_payment_refund_transaction_in(&mut tx, actor, pay.id, reversal_id)
                 .await?;
         }
 
         let cancelled = self
             .returns
-            .set_cancelled(return_id, actor, reason.as_deref())
+            .set_cancelled_in(&mut tx, return_id, actor, reason.as_deref())
             .await?;
+
+        tx.commit().await?;
+
         self.detail_for(cancelled).await
     }
 
@@ -949,7 +985,10 @@ mod tests {
         SqliteCustomerReturnRepository, SqliteDocSequenceRepository, SqliteProductRepository,
         SqliteSaleRepository, SqliteStockMovementRepository, SqliteTransactionRepository,
     };
-    use crate::repositories::{PartyLedgerRepository, SqlitePartyLedgerRepository};
+    use crate::repositories::{
+        PartyLedgerRepository, PaymentRepository, SqlitePartyLedgerRepository,
+        SqlitePaymentRepository,
+    };
     use crate::security::test_support;
     use crate::services::{InventoryService, TransactionService};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -968,6 +1007,7 @@ mod tests {
         SqliteAccountRepository,
         SqliteTransactionRepository,
         SqlitePartyLedgerRepository,
+        SqlitePaymentRepository,
     >;
 
     /// `max_connections(1)` is LOAD-BEARING for every test in this module. While
@@ -1014,6 +1054,7 @@ mod tests {
                 allow_balance,
             ),
             SqlitePartyLedgerRepository::new(pool.clone()),
+            SqlitePaymentRepository::new(pool.clone()),
         );
         (s, pool)
     }

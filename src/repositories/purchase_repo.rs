@@ -396,6 +396,23 @@ pub trait PurchaseRepository: Send + Sync {
         payment_id: i64,
         refund_transaction_id: i64,
     ) -> AppResult<PurchasePayment>;
+    /// [`Self::set_payment_refund_transaction`] inside a transaction the CALLER owns.
+    /// T3d needs it: the refund movement, its link and the cancellation are ONE unit.
+    async fn set_payment_refund_transaction_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        payment_id: i64,
+        refund_transaction_id: i64,
+    ) -> AppResult<PurchasePayment>;
+    /// [`Self::set_cancelled`] inside a transaction the CALLER owns. Same reason.
+    async fn set_cancelled_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+        actor: i64,
+        reason: Option<&str>,
+    ) -> AppResult<Purchase>;
     async fn list_payments(&self, purchase_id: i64) -> AppResult<Vec<PurchasePayment>>;
     /// One payment by id — the documents drawer's per-payment read. `None`
     /// for an id that does not exist; the service decides what that means.
@@ -885,6 +902,19 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         actor: i64,
         reason: Option<&str>,
     ) -> AppResult<Purchase> {
+        let mut tx = self.pool.begin().await?;
+        let cancelled = self.set_cancelled_in(&mut tx, id, actor, reason).await?;
+        tx.commit().await?;
+        Ok(cancelled)
+    }
+
+    async fn set_cancelled_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+        actor: i64,
+        reason: Option<&str>,
+    ) -> AppResult<Purchase> {
         let clean = reason.and_then(|s| {
             let t = s.trim();
             if t.is_empty() {
@@ -904,7 +934,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         .bind(clean)
         .bind(actor)
         .bind(id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_purchase(row))
@@ -1137,6 +1167,21 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         payment_id: i64,
         refund_transaction_id: i64,
     ) -> AppResult<PurchasePayment> {
+        let mut tx = self.pool.begin().await?;
+        let linked = self
+            .set_payment_refund_transaction_in(&mut tx, actor, payment_id, refund_transaction_id)
+            .await?;
+        tx.commit().await?;
+        Ok(linked)
+    }
+
+    async fn set_payment_refund_transaction_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        payment_id: i64,
+        refund_transaction_id: i64,
+    ) -> AppResult<PurchasePayment> {
         let row = sqlx::query(
             r#"UPDATE purchase_payments
                SET refund_transaction_id = ?, updated_by = ?,
@@ -1147,7 +1192,7 @@ impl PurchaseRepository for SqlitePurchaseRepository {
         .bind(refund_transaction_id)
         .bind(actor)
         .bind(payment_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_payment(row))

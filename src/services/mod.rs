@@ -72,4 +72,5 @@ pub use setup::SetupService;
 pub use suppliers::SupplierService;
 pub use taxes::TaxService;
 pub use transaction::TransactionService;
+pub mod payment_writer;
 pub mod purchase_cost;

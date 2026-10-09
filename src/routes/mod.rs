@@ -136,6 +136,7 @@ pub type PurchaseReturnSvc = PurchaseReturnService<
     SqliteAccountRepository,
     SqliteTransactionRepository,
     SqlitePartyLedgerRepository,
+    SqlitePaymentRepository,
 >;
 
 /// Credit notes (M-purchase returns): the customer sends goods BACK to the
@@ -152,6 +153,7 @@ pub type CustomerReturnSvc = CustomerReturnService<
     SqliteAccountRepository,
     SqliteTransactionRepository,
     SqlitePartyLedgerRepository,
+    SqlitePaymentRepository,
 >;
 
 pub type PurchasesSvc = PurchasesService<
@@ -168,6 +170,7 @@ pub type PurchasesSvc = PurchasesService<
     SqlitePaymentMethodRepository,
     SqliteTaxSnapshotRepository,
     SqlitePartyLedgerRepository,
+    SqlitePaymentRepository,
 >;
 
 /// The identity service the deny-by-default gate and the login/logout routes
@@ -471,6 +474,8 @@ impl AppState {
             SqliteTaxSnapshotRepository::new(pool.clone()),
             // T2: the supplier journal `confirm` appends to, over the same pool.
             SqlitePartyLedgerRepository::new(pool.clone()),
+            // T3d: the refund deliveries a cancellation writes.
+            SqlitePaymentRepository::new(pool.clone()),
         );
         // M-purchase returns. THE FLAGS ARE THE PARENT'S, and deliberately so:
         // both return services take the SAME `inventory_service` and
@@ -517,6 +522,8 @@ impl AppState {
             transaction_service.clone(),
             // T2: the supplier journal a confirmed purchase return appends to.
             SqlitePartyLedgerRepository::new(pool.clone()),
+            // T3d: the reversal deliveries `cancel` writes.
+            SqlitePaymentRepository::new(pool.clone()),
         );
         let customer_return_service = CustomerReturnService::new(
             SqliteCustomerReturnRepository::new(pool.clone()),
@@ -526,6 +533,8 @@ impl AppState {
             transaction_service.clone(),
             // T2: the customer journal a confirmed credit note appends to.
             SqlitePartyLedgerRepository::new(pool.clone()),
+            // T3d: the reversal deliveries `cancel` writes.
+            SqlitePaymentRepository::new(pool.clone()),
         );
         // The documents index composes the four families' read paths; it holds
         // only reads, so wiring it never moves write ownership.

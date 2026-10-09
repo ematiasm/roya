@@ -318,6 +318,14 @@ pub trait PurchaseReturnRepository: Send + Sync {
         actor: i64,
         reason: Option<&str>,
     ) -> AppResult<PurchaseReturn>;
+    /// The `_in` twin, for the same reason (T3d).
+    async fn set_cancelled_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+        actor: i64,
+        reason: Option<&str>,
+    ) -> AppResult<PurchaseReturn>;
 
     /// Delete a DRAFT purchase return — or a DISCARDED one (Cancelled while
     /// never confirmed: `return_number IS NULL`) — and let its lines die by
@@ -414,6 +422,14 @@ pub trait PurchaseReturnRepository: Send + Sync {
     /// BOTH links.
     async fn set_payment_refund_transaction(
         &self,
+        actor: i64,
+        payment_id: i64,
+        refund_transaction_id: i64,
+    ) -> AppResult<PurchaseReturnPayment>;
+    /// The `_in` twin: the reversal, its link and the cancellation are ONE unit (T3d).
+    async fn set_payment_refund_transaction_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
         actor: i64,
         payment_id: i64,
         refund_transaction_id: i64,
@@ -738,6 +754,19 @@ impl PurchaseReturnRepository for SqlitePurchaseReturnRepository {
         actor: i64,
         reason: Option<&str>,
     ) -> AppResult<PurchaseReturn> {
+        let mut tx = self.pool.begin().await?;
+        let cancelled = self.set_cancelled_in(&mut tx, id, actor, reason).await?;
+        tx.commit().await?;
+        Ok(cancelled)
+    }
+
+    async fn set_cancelled_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+        actor: i64,
+        reason: Option<&str>,
+    ) -> AppResult<PurchaseReturn> {
         let clean = reason.and_then(|s| {
             let t = s.trim();
             if t.is_empty() {
@@ -758,7 +787,7 @@ impl PurchaseReturnRepository for SqlitePurchaseReturnRepository {
         .bind(clean)
         .bind(actor)
         .bind(id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_return(row))
@@ -1012,6 +1041,21 @@ impl PurchaseReturnRepository for SqlitePurchaseReturnRepository {
         payment_id: i64,
         refund_transaction_id: i64,
     ) -> AppResult<PurchaseReturnPayment> {
+        let mut tx = self.pool.begin().await?;
+        let linked = self
+            .set_payment_refund_transaction_in(&mut tx, actor, payment_id, refund_transaction_id)
+            .await?;
+        tx.commit().await?;
+        Ok(linked)
+    }
+
+    async fn set_payment_refund_transaction_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        payment_id: i64,
+        refund_transaction_id: i64,
+    ) -> AppResult<PurchaseReturnPayment> {
         // Only the reversal link moves; `transaction_id` is left exactly as the
         // refund recorded it, which is what lets one row carry both.
         let row = sqlx::query(
@@ -1024,7 +1068,7 @@ impl PurchaseReturnRepository for SqlitePurchaseReturnRepository {
         .bind(refund_transaction_id)
         .bind(actor)
         .bind(payment_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_payment(row))
