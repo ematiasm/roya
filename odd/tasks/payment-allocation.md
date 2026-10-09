@@ -338,6 +338,34 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   payment row leaves neither; collecting 3 invoices with one amount writes **one**
   `Income`; overpaying leaves `unapplied > 0` and no error; applying that credit to
   a later sale writes an allocation and **no** cash movement.
+- [x] **P3d — The four `cancel` paths write their refund as a delivery, inside one
+  unit.**
+  **CLOSED 2026-10-08 — committed as `226ef09` (sale), `38bb8cd` (the other three plus
+  the shared writer) and `54dae4a` (their pins).** What it turned out to need, beyond
+  what this task predicted:
+  * the writer had to MOVE. It was a method on `SalesService`, so the other three
+    families could not reach it. It is now `services::payment_writer::record_delivery_in`,
+    a free function over exactly the four repositories it touches (sequences,
+    transactions, ledger, payments) — the callers share no trait, and naming the
+    collaborators is what keeps it unable to touch anything else. The move DROPPED a
+    warning instead of adding one.
+  * six more `_in` twins, not two: `set_payment_refund_transaction_in` and
+    `set_cancelled_in` on each of the four repositories, one copy of each statement
+    with the public form as the thin wrapper.
+  * the direction is per family and follows the money: a sale refund is `Out`, a
+    purchase refund `In`, a credit-note reversal `In`, a purchase-return reversal
+    `Out` — the one direction where a reversal can be refused for want of funds.
+  Observed: `cargo test --locked` 1552 passed / 0 failed; `scripts/e2e.sh` 180 passed /
+  0 failed; warnings 79 bin / 55 test, one below where the unit started. Every one of the
+  four is pinned by an injected failure on the cancellation UPDATE — the LAST write of
+  the unit — and all four were MUTATED rather than assumed: putting the refund back in
+  its own transaction makes each fail after 30s with `pool timed out`.
+  Resolved along the way, and worth knowing: a cancelled sale ends up with TWO
+  deliveries (the `In` and the `Out`), which is consistent with the append-only ledger
+  and is the answer to the question this task left open. The refund **replays the parent
+  payment's account** (decision 9), reading the historical `account_id`/`method_id` off
+  the payment row and never re-deriving them from the method.
+
 - [ ] **P3d — The four `cancel` paths write their refund as a delivery, inside one
   unit.** Split out of P3 on 2026-10-08 after measuring it, because it is NOT the
   small edit the P3 line implied. Measured on the tree:
