@@ -1413,18 +1413,17 @@ mod tests {
             "the document must never carry a negative residual"
         );
 
-        // **The party's BALANCE still cannot see the credit, and that is P5's job.**
-        //
-        // `customer_balance` folds the old document family (sales minus their legacy
-        // payment rows), and the legacy rows carry what was APPLIED — 30 — so the
-        // balance reads 30 - 30 = 0 while the customer is really owed 1. This is not a
-        // bug introduced here: it is the same split the plan already records, and moving
-        // those folds onto the allocations is P5. The test asserts TODAY'S truth so the
-        // day P5 lands, the assertion failing is the reminder to update it.
+        // **P5 has landed, and this is the number it promised.** The comment that
+        // used to sit here said the legacy fold read `30 - 30 = 0` while the customer
+        // is really owed 1, and that the day P5 moved the fold this assertion would fail
+        // as the reminder to update it. It did, and `-1` is the correct figure: the
+        // documents' residual is zero (the 30 sale is settled by 30 applied) and the
+        // unapplied 1 is credit the shop holds, so `balance == Σ residuals − Σ unapplied`
+        // is `0 − 1`. A negative balance is a saldo a favor, not an error.
         assert_eq!(
             s.sales.customer_balance(customer).await.unwrap(),
-            Decimal::ZERO,
-            "P5 will move this fold and make it -1; until then it reads the legacy rows"
+            dec("-1"),
+            "the residual is settled and the unapplied 1 is credit: 0 - 1"
         );
         // The credit itself is already readable where it lives: on the delivery.
         assert_eq!(
@@ -1456,11 +1455,17 @@ mod tests {
         assert_eq!(second.unapplied, Decimal::ZERO);
         let after_two = s.sales.get_detail(sale_two.sale.id).await.unwrap();
         assert_eq!(after_two.due, dec("1"));
-        // Same caveat as above: the legacy fold sees 20 owed and 19 applied.
+        // The customer owes NOTHING, and that is the whole point of the identity. The
+        // second document's residual is 1, and the shop is still holding the 1 of credit
+        // from the first collection (it was not applied to this document — the collection
+        // only applies what it brings, asserted above). So `Σ residuals − Σ unapplied` is
+        // `1 − 1 = 0`. Business control: the customer paid `31 + 19 = 50` for goods worth
+        // `30 + 20 = 50`. Under the legacy fold this could only read 1, because a fold over
+        // a document family cannot see money the shop holds on the party's behalf.
         assert_eq!(
             s.sales.customer_balance(customer).await.unwrap(),
-            dec("1"),
-            "the legacy fold reads 20 owed minus 19 applied; P5 is what nets the credit"
+            dec("0"),
+            "the remaining residual is offset by the credit still held: 1 - 1"
         );
     }
 
