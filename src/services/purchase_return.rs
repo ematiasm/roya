@@ -57,7 +57,7 @@ struct RefundPlan {
 }
 
 #[derive(Clone)]
-pub struct PurchaseReturnService<RR, DR, PR, C, P, B, S, A, T>
+pub struct PurchaseReturnService<RR, DR, PR, C, P, B, S, A, T, PL>
 where
     RR: crate::repositories::PurchaseReturnRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -68,15 +68,20 @@ where
     S: crate::repositories::StockMovementRepository,
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
+    PL: crate::repositories::PartyLedgerRepository,
 {
     pub returns: RR,
     pub sequences: DR,
     pub purchases: PR,
     pub inventory: crate::services::InventoryService<C, P, B, S>,
     pub transactions: crate::services::TransactionService<A, T>,
+    /// The supplier's signed journal (T2), mirroring the customer side: a
+    /// confirmed return appends the `Return` that cancels part of the purchase's
+    /// `Charge`, in the same unit that moves the stock back.
+    pub party_ledger: PL,
 }
 
-impl<RR, DR, PR, C, P, B, S, A, T> PurchaseReturnService<RR, DR, PR, C, P, B, S, A, T>
+impl<RR, DR, PR, C, P, B, S, A, T, PL> PurchaseReturnService<RR, DR, PR, C, P, B, S, A, T, PL>
 where
     RR: crate::repositories::PurchaseReturnRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -87,6 +92,7 @@ where
     S: crate::repositories::StockMovementRepository,
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
+    PL: crate::repositories::PartyLedgerRepository,
 {
     pub fn new(
         returns: RR,
@@ -94,6 +100,7 @@ where
         purchases: PR,
         inventory: crate::services::InventoryService<C, P, B, S>,
         transactions: crate::services::TransactionService<A, T>,
+        party_ledger: PL,
     ) -> Self {
         Self {
             returns,
@@ -101,6 +108,7 @@ where
             purchases,
             inventory,
             transactions,
+            party_ledger,
         }
     }
 
@@ -673,7 +681,33 @@ where
                 .await?;
         }
 
-        // 5. The document exists from here.
+        // 5. The supplier's journal, in the SAME unit as the stock movement (T2
+        // of odd/tasks/party-ledger.md). A purchase return sends goods back, so it
+        // cancels part of what the purchase charged: a `Return` of `−total`, which
+        // folds the payable down by what went back.
+        //
+        // Written even when the refund plan is EMPTY, for the same reason as the
+        // customer side: the goods left whether or not money came with them, and a
+        // purchase confirmed but unpaid legitimately returns goods the shop has
+        // not paid for yet.
+        self.party_ledger
+            .insert_in(
+                &mut tx,
+                &crate::models::NewPartyLedgerEntry {
+                    party_type: crate::models::PartyType::Supplier,
+                    party_id: purchase.supplier_id,
+                    kind: crate::models::PartyEntryKind::Return,
+                    amount: crate::models::PartyEntryKind::Return.signed_amount(total),
+                    document_kind: crate::models::PartyDocumentKind::PurchaseReturn,
+                    document_id: return_id,
+                    entry_date: purchase_return.return_date,
+                    reference: Some(return_number.clone()),
+                    created_by: actor,
+                },
+            )
+            .await?;
+
+        // 6. The document exists from here.
         let confirmed = self
             .returns
             .set_confirmed_in(&mut tx, return_id, actor, &return_number)
@@ -931,6 +965,7 @@ mod tests {
         SqliteDocSequenceRepository, SqliteProductRepository, SqlitePurchaseRepository,
         SqlitePurchaseReturnRepository, SqliteStockMovementRepository, SqliteTransactionRepository,
     };
+    use crate::repositories::{PartyLedgerRepository, SqlitePartyLedgerRepository};
     use crate::security::test_support;
     use crate::services::{InventoryService, TransactionService};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -948,6 +983,7 @@ mod tests {
         SqliteStockMovementRepository,
         SqliteAccountRepository,
         SqliteTransactionRepository,
+        SqlitePartyLedgerRepository,
     >;
 
     /// `max_connections(1)` is LOAD-BEARING for every test in this module and is
@@ -997,6 +1033,7 @@ mod tests {
                 SqliteTransactionRepository::new(pool.clone()),
                 allow_balance,
             ),
+            SqlitePartyLedgerRepository::new(pool.clone()),
         );
         (s, pool)
     }
@@ -1250,6 +1287,122 @@ mod tests {
             purchase_line_id: line,
             return_id: purchase_return.id,
         }
+    }
+
+    // -- the party ledger (T2) ---------------------------------------------------
+
+    /// The journal rows this return wrote, as the sign rule stored them.
+    async fn ledger_rows(pool: &SqlitePool, document_id: i64) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT kind, amount FROM party_ledger_entries \
+             WHERE document_kind = 'PurchaseReturn' AND document_id = ? ORDER BY id",
+        )
+        .bind(document_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A purchase return cancels part of the payable: one `Return` of `−total` on
+    /// the supplier.
+    #[tokio::test]
+    async fn a_confirmed_purchase_return_appends_one_return_on_the_supplier() {
+        let (s, pool) = svc().await;
+        // Two units at 5 is 10, and the whole 10 was paid, so the refund plan is
+        // full and the cap is not what this test is about.
+        let p = draft_return(
+            &s,
+            &pool,
+            "LEDGER-PR",
+            "Ledger PR Supplier",
+            "2",
+            "5",
+            &[("ledger pr till", "10")],
+            "2",
+        )
+        .await;
+
+        s.confirm(actor(&pool).await, p.return_id).await.unwrap();
+
+        assert_eq!(
+            ledger_rows(&pool, p.return_id).await,
+            vec![("Return".to_string(), "-10".to_string())],
+            "goods went back, so the payable comes down: one Return"
+        );
+    }
+
+    /// THE case the empty refund plan exists for: a purchase confirmed but NOT
+    /// paid still returns goods, so the payable comes down while no money moves.
+    /// An implementation that wrote the entry only alongside a refund would leave
+    /// the shop owing for goods it sent back.
+    #[tokio::test]
+    async fn an_unpaid_parent_still_returns_the_payable_with_no_refund() {
+        let (s, pool) = svc().await;
+        // Nothing paid: the fixture's refund plan is empty.
+        let p = draft_return(
+            &s,
+            &pool,
+            "LEDGER-PR-UNPAID",
+            "Ledger PR Unpaid Supplier",
+            "2",
+            "5",
+            &[],
+            "2",
+        )
+        .await;
+
+        s.confirm(actor(&pool).await, p.return_id).await.unwrap();
+
+        assert_eq!(
+            ledger_rows(&pool, p.return_id).await,
+            vec![("Return".to_string(), "-10".to_string())],
+            "the goods went back, so the payable comes down even though money did not move"
+        );
+        assert_eq!(
+            tx_count(&pool).await,
+            0,
+            "and no cash entry exists: the Return is about the goods, not the money"
+        );
+    }
+
+    /// The write joins the caller's unit, so a failure after it takes the entry
+    /// with it.
+    #[tokio::test]
+    async fn a_failed_purchase_return_confirm_rolls_its_return_entry_back() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "LEDGER-PR-RB",
+            "Ledger PR Rollback Supplier",
+            "2",
+            "5",
+            &[("ledger pr rb till", "10")],
+            "2",
+        )
+        .await;
+
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_ledger_probe BEFORE UPDATE ON purchase_returns \
+             WHEN NEW.status = 'Confirmed' \
+             BEGIN SELECT RAISE(ABORT, 'injected failure after the ledger write'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .confirm(actor(&pool).await, p.return_id)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+        assert!(
+            ledger_rows(&pool, p.return_id).await.is_empty(),
+            "the entry must die with the unit that wrote it"
+        );
     }
 
     // -- the residue tables, read straight from the database -----------------

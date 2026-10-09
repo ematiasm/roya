@@ -132,6 +132,7 @@ pub type PurchaseReturnSvc = PurchaseReturnService<
     SqliteStockMovementRepository,
     SqliteAccountRepository,
     SqliteTransactionRepository,
+    SqlitePartyLedgerRepository,
 >;
 
 /// Credit notes (M-purchase returns): the customer sends goods BACK to the
@@ -509,6 +510,8 @@ impl AppState {
             SqlitePurchaseRepository::new(pool.clone()),
             inventory_service.clone(),
             transaction_service.clone(),
+            // T2: the supplier journal a confirmed purchase return appends to.
+            SqlitePartyLedgerRepository::new(pool.clone()),
         );
         let customer_return_service = CustomerReturnService::new(
             SqliteCustomerReturnRepository::new(pool.clone()),
