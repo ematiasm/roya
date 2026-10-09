@@ -1329,6 +1329,56 @@ mod tests {
         }
     }
 
+    /// **T3d on the purchase-return side**, the one direction where a reversal is an
+    /// `Expense` and can be refused for want of funds.
+    #[tokio::test]
+    async fn a_failure_while_cancelling_a_purchase_return_rolls_the_reversals_back() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "T3D-PR-ATOMIC",
+            "T3D PR Atomic Supplier",
+            "2",
+            "5",
+            &[("t3d pr till", "10")],
+            "2",
+        )
+        .await;
+        s.confirm(actor(&pool).await, p.return_id).await.unwrap();
+
+        let tx_before = tx_count(&pool).await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_cancel_failure BEFORE UPDATE ON purchase_returns \
+             WHEN NEW.status = 'Cancelled' \
+             BEGIN SELECT RAISE(ABORT, 'injected failure after the reversals'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .cancel(actor(&pool).await, p.return_id, Some("injected".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+        assert_eq!(
+            tx_count(&pool).await,
+            tx_before,
+            "the reversal movement must die with the unit"
+        );
+        let reversals: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM purchase_return_payments WHERE refund_transaction_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reversals, 0, "and no row claims one");
+    }
+
     // -- the party ledger (T2) ---------------------------------------------------
 
     /// The journal rows this return wrote, as the sign rule stored them.

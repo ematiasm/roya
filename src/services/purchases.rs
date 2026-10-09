@@ -2932,6 +2932,89 @@ mod tests {
         assert_eq!(da.paid, Decimal::ZERO);
     }
 
+    /// **T3d on the purchase side.** Before, the stock left and each refund was posted
+    /// in a unit of its own, then the purchase was cancelled: a failure in between left
+    /// the money refunded and the document still Confirmed. The failure is injected on
+    /// the cancellation UPDATE, the LAST write of the unit.
+    #[tokio::test]
+    async fn a_failure_while_cancelling_rolls_the_purchase_refunds_back() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "T3D-P-ATOMIC", "10").await;
+        let sup = seed_supplier(&s, "T3D P Atomic Supplier").await;
+        let acc = seed_account(&s, "t3d-p-atomic").await;
+        let cash = own_method(&s, acc.id, "Cash").await;
+        s.transactions
+            .create(
+                audit_actor(&s).await,
+                acc.id,
+                TransactionKind::Income,
+                dec("1000"),
+                Some("fondo".into()),
+                purchase_date(),
+            )
+            .await
+            .unwrap();
+        let purchase = draft_cash(&s, sup.id).await;
+        s.add_line(
+            audit_actor(&s).await,
+            purchase.id,
+            prod.id,
+            dec("2"),
+            Some(dec("10")),
+        )
+        .await
+        .unwrap(); // total 20
+        let detail = s
+            .confirm(audit_actor(&s).await, purchase.id, Some(cash))
+            .await
+            .unwrap();
+        assert_eq!(
+            detail.purchase.status,
+            crate::models::PurchaseStatus::Confirmed
+        );
+
+        let tx_before = tx_count(&pool).await;
+
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_cancel_failure BEFORE UPDATE ON purchases \
+             WHEN NEW.status = 'Cancelled' \
+             BEGIN SELECT RAISE(ABORT, 'injected failure after the refunds'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .cancel(audit_actor(&s).await, purchase.id, Some("injected".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+        assert_eq!(
+            tx_count(&pool).await,
+            tx_before,
+            "the refund movement must die with the unit"
+        );
+        let reversals: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE direction = 'In'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reversals, 0, "no refund document exists");
+        assert_eq!(
+            s.purchases
+                .find_purchase(purchase.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .status,
+            crate::models::PurchaseStatus::Confirmed,
+            "the purchase is still live: the refusal was a refusal"
+        );
+    }
+
     // -- the party ledger (T2) ---------------------------------------------------
 
     /// The journal rows of one document, as the sign rule stored them.

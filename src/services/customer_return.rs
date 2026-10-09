@@ -2747,6 +2747,62 @@ mod tests {
     /// note therefore cannot touch the satellite even by accident of a
     /// mis-mapped field, and this test proves the table is untouched anyway —
     /// against a NON-EMPTY satellite, so it does not pass for the wrong reason.
+    /// **T3d on the credit-note side.** A cancelled credit note used to post each
+    /// reversal in a unit of its own and only then flip the note: a failure in between
+    /// left the money reversed and the note still Confirmed.
+    #[tokio::test]
+    async fn a_failure_while_cancelling_a_credit_note_rolls_the_reversals_back() {
+        let (s, pool) = svc().await;
+        let p = draft_credit_note(
+            &s,
+            &pool,
+            "T3D-CR-ATOMIC",
+            "T3D CR Atomic",
+            "2",
+            "5",
+            &[("t3d cr till", "10")],
+            "2",
+        )
+        .await;
+        s.confirm(actor(&pool).await, p.return_id).await.unwrap();
+
+        let tx_before = tx_count(&pool).await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_cancel_failure BEFORE UPDATE ON customer_returns \
+             WHEN NEW.status = 'Cancelled' \
+             BEGIN SELECT RAISE(ABORT, 'injected failure after the reversals'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .cancel(actor(&pool).await, p.return_id, Some("injected".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+        assert_eq!(
+            tx_count(&pool).await,
+            tx_before,
+            "the reversal movement must die with the unit"
+        );
+        let reversals: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM customer_return_payments WHERE refund_transaction_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reversals, 0, "and no row claims one");
+        assert_eq!(
+            row_state(&pool, p.return_id).await.0,
+            "Confirmed",
+            "the note is still live"
+        );
+    }
+
     // -- the party ledger (T2) ---------------------------------------------------
 
     /// The journal rows this credit note wrote, as the sign rule stored them.
