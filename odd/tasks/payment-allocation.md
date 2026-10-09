@@ -2,13 +2,15 @@
 
 ## Status
 
-**In progress — P1, P3 (a/b/c/d), P4, P5.1, P5.2a, P5.2b and P5x are DONE; P5.3, P6, P7
-and P8 remain.** Measured at `7727fa8`: `cargo test --locked` **1567 passed / 0 failed**,
-warnings 80 bin / 55 test. `customer_balance` is `Σ residuals − unapplied_for_party`, and
-the same batch residual feeds the ageing and the statement.
-**Next is P5.3, and it is NOT "delete the writes"**: `sale_payments` still has seven live
-production readers, spelled out under "What P5.3 inherits". See that section and "P5
-blocker" before starting.
+**In progress — P1, P3 (a/b/c/d), P4, P5.1, P5.2a, P5.2b and P5x are DONE; P5.3
+(a/b/c), P6, P7 and P8 remain.** Measured at `7727fa8`: `cargo test --locked` **1567
+passed / 0 failed**, warnings 80 bin / 55 test. The CUSTOMER side reads
+`Σ residuals − unapplied_for_party`; the supplier side is still on `purchase_payments`.
+**Next is P5.3a (the supplier reads) and the plan is spelled out under "What P5.3
+inherits"**, which is also where an earlier claim of mine is corrected: the legacy tables
+do NOT have seven readers, they have dozens across all five tables, because the first
+count mixed `#[cfg(test)] mod tests` hits with production code. Read that section before
+starting; the drop cannot happen until every row of that table moves.
 The earlier `feat/party-ledger-p5` / `-p6` branch plan is dropped: the remaining slices go
 in ONE PR on `feat/party-ledger` (tracker PR
 [#150](https://github.com/ematiasm/roya/pull/150), draft, no merge before P8).
@@ -838,26 +840,56 @@ decisions.
   working. A warning-count drop is the right signal when a new symbol is consumed
   DIRECTLY, not when a layer is inserted in the middle. The count is back to 80/55.
 
-## What P5.3 inherits, measured — `sale_payments` is NOT unread
+## What P5.3 inherits, measured — the legacy tables still have MANY readers
 
-The grep a legacy deletion needs, run at `f5b39ef`. **This is why the legacy writes
-cannot simply be deleted**, and it is the real content of P5.3:
+**An earlier revision of this section said "seven live readers". That was WRONG** — it
+counted hits without separating production code from `#[cfg(test)] mod tests`, and it
+looked at `sale_payments` only. The measured inventory at `7727fa8` scans all FIVE legacy
+tables and stops at each file's first test module. It is why P5.3 is three units and not
+one, and it is the number that decides when the tables can actually be dropped.
 
-- `list_customer_credit_ledger` (`sale_repo.rs:853` holds its `sale_payments` SELECT)
-  and `list_confirmed_credit_ledger_all` are now DEAD: no call sites anywhere in `src/`.
-  The reads stopped asking for them, which is what made the folds above possible.
-- `sale_payments` still has LIVE production readers: `sale_repo.rs:1312` (a document's
-  payment rows), `:1325` (payment lookup), `:1336` (receipt payment rows), `:1480`
-  (payment document listing), `:1551` (receipt allocation totals), `party_ledger_repo.rs:468`
-  (the T1 backfill, which P8 re-bases) and `transaction.rs:472` (refund metadata lookup).
-- `self.sales.list_payments(` is still called in `sales.rs` for the DETAIL view (a record
-  page showing its own payments) at `:445`, `:653`, `:685`, `:953` and `:2025`. Those are
-  legitimately out of P5's scope, and they are the reason the writes survive it.
+**Now dead (no call sites in `src/` at all):** `list_customer_credit_ledger`
+(`sale_repo.rs:804`, whose SELECT at `:853` is the only reader left there) and
+`list_confirmed_credit_ledger_all` (`:818`). The reads stopped asking for them, which is
+what made P5.2b's folds possible.
 
-So P5.3 is not "delete the writes": it is "move the detail/record payment rows and the
-receipt totals onto `payments` + `payment_allocations`, then delete the writes, then let
-the two dead ledger methods go with them." The `allocated_to_target_raw` warning clears
-only when P6 consumes `allocated_to_target`.
+**Live production readers, by table:**
+
+| Table | Readers that must move |
+|---|---|
+| `sale_payments` | `sale_repo.rs` `list_payments` `:1312`, `find_payment` `:1325`, `list_payments_by_receipt` `:1336`, the payment-document listing `:1480`, the receipt allocation totals `:1551`. Writes: INSERT `:1250`, UPDATE `:1292` |
+| `purchase_payments` | `purchase_repo.rs` `list_payments` `:1205`, `find_payment` `:1217`, the payment-document listing `:1372`. Writes: INSERT `:1147`, UPDATE `:1186` |
+| `customer_return_payments` | `customer_return_repo.rs` `list_payments` `:1077`, `payment_account_and_method` `:1174`, three `COUNT(*)` guards `:2181`, `:2220`, `:2306`. Writes: INSERT `:1019`, UPDATE `:1060` |
+| `purchase_return_payments` | `purchase_return_repo.rs` `list_payments` `:1079`, `payment_account_and_method` `:1178`, three `COUNT(*)` guards `:2182`, `:2221`, `:2307`. Writes: INSERT `:1021`, UPDATE `:1062` |
+| `customer_receipts` | `customer_receipt_repo.rs` `find` `:166`, `list_for_customer` `:177`, the documents listing `:221`. Writes: INSERT `:147`, DELETE `:190` |
+
+Plus, and these are the ones easy to miss because they are not `SELECT ... FROM` a
+payment table at all:
+
+- `party_ledger_repo.rs:468`, `:543`, `:621`, `:699` — the T1 backfill reads all four
+  payment tables. This is P8's second half and it is a REQUIRED edit, not cleanup.
+- `transaction.rs:472` — the refund metadata lookup.
+- `purchase_return.rs` `:1303`, `:1395`, `:1658`, `:1860`, `:2447`, `:2461`, `:2464`,
+  `:3486`, `:3488` — refund planning, the refunded-count guard, and the integrity
+  predicates that walk a `transactions` row against the legacy payment rows.
+- `routes/*_api.rs` / `*_web.rs` — paired `COUNT(*)` assertions a handful of route tests
+  use to prove a write did not appear. Those are tests, but they are IN FILES WITH
+  PRODUCTION CODE, which is exactly what the earlier count got wrong.
+
+The consequence for planning, stated plainly: **nothing can be dropped until every row
+of that table moves.** So the remaining work is:
+
+- **P5.3a — the supplier side reads**, mirroring P5.2b: `paid_and_due` still takes
+  `&[PurchasePayment]` (`purchases.rs:268`, called at `:294`) while the sales twin already
+  takes the residual (`sales.rs:327`). Needed anyway for P6's payables and drawer.
+- **P5.3b — the return families' reads.**
+- **P5.3c — the removals**, and only when the two units above have emptied the readers:
+  the writes, the six `COUNT(*)` guards, the `find_payment`/`list_payments_by_receipt`
+  pair, the payment-document listings, and finally the dead ledger methods.
+
+P8 keeps its other half: re-basing the T1 backfill, which is the LAST reader and the one
+that will fail with "no such table" if the drop lands first. The
+`allocated_to_target_raw` warning clears only when P6 consumes `allocated_to_target`.
 
 ## Resume here
 
