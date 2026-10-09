@@ -8,6 +8,7 @@ pub mod customer_return_repo;
 pub mod doc_sequence_repo;
 pub mod party_ledger_repo;
 pub mod payment_method_repo;
+pub mod payment_repo;
 pub mod permission_repo;
 pub mod product_repo;
 pub mod product_supplier_cost_repo;
@@ -63,6 +64,7 @@ pub use customer_return_repo::{CustomerReturnRepository, SqliteCustomerReturnRep
 pub use doc_sequence_repo::{DocSequenceRepository, SqliteDocSequenceRepository};
 pub use party_ledger_repo::{PartyLedgerRepository, SqlitePartyLedgerRepository};
 pub use payment_method_repo::{PaymentMethodRepository, SqlitePaymentMethodRepository};
+pub use payment_repo::{PaymentRepository, SqlitePaymentRepository};
 pub use permission_repo::{PermissionRepository, SqlitePermissionRepository};
 pub use product_repo::{ProductRepository, SqliteProductRepository};
 pub use product_supplier_cost_repo::{
