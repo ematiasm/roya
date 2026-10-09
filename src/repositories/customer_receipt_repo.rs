@@ -61,6 +61,15 @@ fn map_db_err(e: sqlx::Error) -> AppError {
 #[async_trait]
 pub trait CustomerReceiptRepository: Send + Sync {
     async fn create(&self, actor: i64, input: &NewReceipt) -> AppResult<CustomerReceipt>;
+    /// [`Self::create`] inside a transaction the CALLER owns. P3b needs it: the
+    /// receipt and the delivery of money it groups are ONE unit, so the grouping
+    /// document cannot survive without the money it groups.
+    async fn create_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        input: &NewReceipt,
+    ) -> AppResult<CustomerReceipt>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<CustomerReceipt>>;
     /// Receipts of one customer, oldest first (`date`, then id).
     async fn list_by_customer(&self, customer_id: i64) -> AppResult<Vec<CustomerReceipt>>;
@@ -122,6 +131,18 @@ impl SqliteCustomerReceiptRepository {
 #[async_trait]
 impl CustomerReceiptRepository for SqliteCustomerReceiptRepository {
     async fn create(&self, actor: i64, input: &NewReceipt) -> AppResult<CustomerReceipt> {
+        let mut tx = self.pool.begin().await?;
+        let created = self.create_in(&mut tx, actor, input).await?;
+        tx.commit().await?;
+        Ok(created)
+    }
+
+    async fn create_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        input: &NewReceipt,
+    ) -> AppResult<CustomerReceipt> {
         let row = sqlx::query(
             r#"INSERT INTO customer_receipts (customer_id, account_id, method_id, date, notes, created_by)
                VALUES (?, ?, ?, ?, ?, ?)
@@ -133,7 +154,7 @@ impl CustomerReceiptRepository for SqliteCustomerReceiptRepository {
         .bind(input.date)
         .bind(input.notes.clone())
         .bind(actor)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_receipt(row))

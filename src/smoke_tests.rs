@@ -2335,6 +2335,95 @@ async fn payment_guards_derive_the_owner_refuse_foreign_edits_and_stay_inert() {
     assert_eq!(txs[0]["kind"], json!("Income"));
 }
 
+/// **The multi-invoice collection, which is the shape the re-based invariant is
+/// about.** One handover of money covering THREE sales of one customer, collected in
+/// a single request.
+///
+/// This exists because the re-based `claim_transaction` needed a fixture that
+/// exercises it: with three rows naming one transaction, an invariant still keyed on
+/// the ROW would call that a violation, and without this test the difference between
+/// the old and the new concept would not be measurable at all. The mutation that
+/// proves it is putting the row back as the claim's identity.
+#[tokio::test]
+async fn one_collection_over_three_invoices_writes_one_movement_and_three_shares() {
+    let (app, pool) = test_app().await;
+    let cash = method_id(&pool, "Cash").await;
+    let _wallet = create_account_via_web(&app, &pool, "MultiCollect", &[cash]).await;
+    let product = create_product_via_web(&app, &pool, "MULTI-P", "1", "50").await;
+    record_stock_via_web(&app, product, "30").await;
+    let customer = seed_customer(&pool, "Multi Buyer", None, None).await;
+
+    // Three credit sales, three due dates, so the oldest-first plan covers all three.
+    for (sale_date, due) in [
+        ("2024-05-01", "2024-06-01"),
+        ("2024-05-02", "2024-06-10"),
+        ("2024-05-03", "2024-06-20"),
+    ] {
+        let sale = create_sale_draft_on_date(&app, customer, "Credit", sale_date, due).await;
+        add_sale_line_via_web(&app, sale, product, "1").await;
+        confirm_sale_via_web(&app, sale, None).await;
+    }
+    // 3 x 25 = 75 owed before the collection.
+
+    // ONE collection of 60, which the plan spreads over the three sales.
+    let (status, resp) = post_form(
+        &app,
+        "/web/customer-receipts",
+        &format!("customer_id={customer}&method_id={cash}&amount=60&date=2024-06-21"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "collect: {resp}");
+
+    // ONE movement for the delivery, not one per invoice.
+    let movements: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM transactions t \
+          WHERE t.reference GLOB '[0-9][0-9][0-9][0-9]-PAY-[0-9][0-9][0-9][0-9][0-9][0-9]'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(movements, 1, "one handover of money moves cash once");
+
+    // Its document carries the whole amount and is fully applied.
+    let (delivery_id, delivered): (i64, String) =
+        sqlx::query_as("SELECT id, amount FROM payments ORDER BY id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(delivered, "60");
+    let shares: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM payment_allocations WHERE payment_id = ?")
+            .bind(delivery_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(shares, 3, "one share per covered invoice");
+
+    // THREE legacy rows, all naming that ONE movement: the shape the invariant was
+    // re-based for, and the reason "one row per transaction" is the wrong claim.
+    let linked: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT DISTINCT transaction_id, COUNT(*) OVER () FROM sale_payments \
+          WHERE transaction_id IS NOT NULL",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        linked.len(),
+        1,
+        "every covered sale points at the same movement: {linked:?}"
+    );
+
+    // And the whole thing passes the traceability invariant, which is what makes the
+    // re-basing a claim rather than a hope.
+    assert_payment_links_are_traceable(&pool).await;
+
+    // The customer owes what is left: 75 collected 60, so 15 spread over the newest.
+    let (status, body) = get(&app, &format!("/api/customers/{customer}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(dec(&json_body(&body)["balance"]), Decimal::from(15));
+}
+
 /// Money invariants over a database built by real flows: every account balance
 /// is the signed sum of its transactions, and every payment row is traceable to
 /// a real transaction whose `reference` is the document number.
@@ -2541,7 +2630,9 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
         claim_transaction(
             &mut owners,
             transaction_id,
-            format!("sale payment {payment_id} transaction_id"),
+            // The claim's identity is the DELIVERY, not the row: the rows of one
+            // delivery legitimately share a movement, which is decision 5.
+            format!("sale delivery {movement_reference} transaction_id"),
         )?;
         if let Some(refund_id) = refund_transaction_id {
             if refund_id == transaction_id {
@@ -2721,13 +2812,20 @@ fn claim_transaction(
     transaction_id: i64,
     owner: String,
 ) -> Result<(), String> {
-    if let Some(existing) = owners.get(&transaction_id) {
-        return Err(format!(
-            "transaction {transaction_id} is claimed by both {existing} and {owner}; a transaction belongs to exactly one payment"
-        ));
+    match owners.get(&transaction_id) {
+        // The SAME identity claiming a transaction twice is not a collision: the rows
+        // of one delivery all name it, by decision 5. Two DIFFERENT identities
+        // claiming one transaction is the anomaly — that is a cross-delivery swap —
+        // and it is what this map exists to catch.
+        Some(existing) if *existing == owner => Ok(()),
+        Some(existing) => Err(format!(
+            "transaction {transaction_id} is claimed by both {existing} and {owner}; a transaction belongs to exactly one delivery"
+        )),
+        None => {
+            owners.insert(transaction_id, owner);
+            Ok(())
+        }
     }
-    owners.insert(transaction_id, owner);
-    Ok(())
 }
 
 /// The original transaction must exist and carry the document's reference.

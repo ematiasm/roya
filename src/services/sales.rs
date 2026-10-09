@@ -1479,86 +1479,15 @@ where
         // Finance: Cash => 1 payment + Income now; Credit => receivable, no Income.
         // The Income is stamped with reference = sale_number and linked back from
         // the payment row it produced.
-        if sale.payment_type == PaymentType::Cash && total > Decimal::ZERO {
-            let account_id = cash_account_id.unwrap();
-            let method_id = cash_method_id.unwrap();
-            // The cash tender is a DELIVERY of money like any other (decision 5),
-            // so it gets its own `payments` document and its movement is stamped
-            // with THAT number. The sale keeps its own number for the document and
-            // for the ledger entry; the cash row names what actually arrived.
-            //
-            // This is what makes `confirm` (cash) and `record_payment` write the
-            // same shape instead of two: before P3 one stamped the movement with
-            // the sale and the other would have stamped it with the payment.
-            let pay_year = sale.sale_date.year();
-            let pay_seq = self
-                .sequences
-                .next_number_in(&mut tx, "PAYMENT", pay_year)
-                .await?;
-            let cash_payment_number = crate::models::format_payment_number(pay_year, pay_seq);
-            let income = self
-                .transactions
-                .create_with_reference_in(
-                    &mut tx,
-                    actor,
-                    account_id,
-                    crate::models::TransactionKind::Income,
-                    total,
-                    // `description` is the human label on a statement: the SALE.
-                    Some(sale_number.clone()),
-                    // `reference` is the document the money is traceable to: the
-                    // DELIVERY this confirm created.
-                    Some(cash_payment_number.clone()),
-                    sale.sale_date,
-                )
-                .await?;
-            self.sales
-                .create_payment_in(
-                    &mut tx,
-                    actor,
-                    sale_id,
-                    account_id,
-                    method_id,
-                    total,
-                    sale.sale_date,
-                    Some(income.id),
-                    None,
-                )
-                .await?;
-
-            // The delivery document for the tender, with the sale as its one share.
-            let cash_payment = self
-                .payments
-                .create_in(
-                    &mut tx,
-                    &crate::models::NewPayment {
-                        number: cash_payment_number.clone(),
-                        direction: crate::models::PaymentDirection::In,
-                        party_type: crate::models::PartyType::Customer,
-                        party_id: sale.customer_id,
-                        method_id,
-                        account_id,
-                        amount: total,
-                        date: sale.sale_date,
-                        notes: None,
-                        transaction_id: Some(income.id),
-                        created_by: actor,
-                    },
-                )
-                .await?;
-            self.payments
-                .allocate_in(
-                    &mut tx,
-                    &crate::models::NewPaymentAllocation {
-                        payment_id: cash_payment.id,
-                        target_kind: crate::models::PartyDocumentKind::Sale,
-                        target_id: sale_id,
-                        amount: total,
-                        created_by: actor,
-                    },
-                )
-                .await?;
-        }
+        // `cash_account_id`/`cash_method_id` are `Some` exactly when this is a Cash
+        // sale with money to move; the pair is unwrapped here and used far below,
+        // AFTER the charge, because the journal must read: the shop sold, and then
+        // the customer paid.
+        let cash_leg = if sale.payment_type == PaymentType::Cash && total > Decimal::ZERO {
+            Some((cash_account_id.unwrap(), cash_method_id.unwrap()))
+        } else {
+            None
+        };
 
         // The customer's journal, in the SAME unit as the document (T2 of
         // odd/tasks/party-ledger.md). A sale is a CHARGE whichever way it is
@@ -1590,25 +1519,46 @@ where
                 .await?;
         }
 
-        // The cash leg: the same unit, and the `Payment` that offsets the charge
-        // above. Written AFTER the charge so a reader of this transaction's
-        // intermediate states sees a debt and then its settlement, not the
-        // reverse.
-        if sale.payment_type == PaymentType::Cash && total > Decimal::ZERO {
-            self.party_ledger
-                .insert_in(
+        // The cash tender's own `Payment` entry is NOT written here: it belongs to
+        // the DELIVERY, and `record_delivery_in` (called just below, after this
+        // charge) is the one writer that produces it. Writing it here as well put two
+        // `Payment` rows in the journal for one tender — caught by
+        // `a_confirmed_cash_sale_appends_a_charge_and_its_settlement`.
+        // The cash tender, and it comes AFTER the charge so an intermediate reader
+        // sees a debt and then its settlement, never the reverse. It is a DELIVERY
+        // like any other (decision 5) and goes through the ONE writer, which is what
+        // keeps `confirm`, `record_payment` and a multi-invoice collection from
+        // drifting into three opinions about what a delivery looks like.
+        if let Some((account_id, method_id)) = cash_leg {
+            let cash_delivery = self
+                .record_delivery_in(
                     &mut tx,
-                    &crate::models::NewPartyLedgerEntry {
-                        party_type: crate::models::PartyType::Customer,
-                        party_id: sale.customer_id,
-                        kind: crate::models::PartyEntryKind::Payment,
-                        amount: crate::models::PartyEntryKind::Payment.signed_amount(total),
-                        document_kind: crate::models::PartyDocumentKind::Sale,
-                        document_id: sale_id,
-                        entry_date: sale.sale_date,
-                        reference: Some(sale_number.clone()),
-                        created_by: actor,
-                    },
+                    actor,
+                    crate::models::PaymentDirection::In,
+                    crate::models::PartyType::Customer,
+                    sale.customer_id,
+                    method_id,
+                    account_id,
+                    total,
+                    sale.sale_date,
+                    None,
+                    Some(sale_number.clone()),
+                    &[(crate::models::PartyDocumentKind::Sale, sale_id, total)],
+                )
+                .await?;
+
+            // The legacy row, until P5 moves the reads, in the same unit.
+            self.sales
+                .create_payment_in(
+                    &mut tx,
+                    actor,
+                    sale_id,
+                    account_id,
+                    method_id,
+                    total,
+                    sale.sale_date,
+                    cash_delivery.transaction_id,
+                    None,
                 )
                 .await?;
         }
@@ -1629,6 +1579,182 @@ where
         // transaction wrote, so the value is already durable by the time the
         // reads run.
         self.detail_for(confirmed).await
+    }
+
+    /// Link one covered sale to the delivery's SINGLE movement, in the caller's unit.
+    ///
+    /// This is the legacy `sale_payments` row, kept until P5 moves the reads: the
+    /// receipt's own read asks for it, and with decision 8 it stops being the HOME of
+    /// the attribution (that is `payment_allocations`) and becomes a pointer that
+    /// lets the old read keep answering.
+    ///
+    /// Every row written this way names the SAME `transaction_id`, which is why the
+    /// traceability invariant had to be re-based: a transaction belongs to one
+    /// DELIVERY, and N documents may share it inside that delivery.
+    pub async fn link_delivery_payment_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        receipt_id: i64,
+        sale_id: i64,
+        account_id: i64,
+        method_id: i64,
+        amount: Decimal,
+        date: NaiveDate,
+        transaction_id: Option<i64>,
+    ) -> AppResult<SalePayment> {
+        self.sales
+            .create_payment_in(
+                tx,
+                actor,
+                sale_id,
+                account_id,
+                method_id,
+                amount,
+                date,
+                transaction_id,
+                Some(receipt_id),
+            )
+            .await
+    }
+
+    /// **THE ONE WRITER of a delivery of money** (P3, decisions 5 and 8).
+    ///
+    /// Records a `payments` document, the ONE cash movement it produced, its
+    /// allocations, and the party-ledger entry — every write on the caller's
+    /// connection. The delivery's number comes from `doc_sequences` inside that
+    /// connection, so a rollback returns it instead of burning it.
+    ///
+    /// There is deliberately ONE such method rather than one per entry point. The
+    /// three ways money arrives as `In` — a direct payment on a sale, a collection
+    /// across several invoices, and the cash tender of a `confirm` — differ only in
+    /// how many allocations they carry and whether a receipt groups them. Two
+    /// writers would be two opinions about what a delivery looks like, which is the
+    /// disease the payments family exists to cure.
+    ///
+    /// `allocations` are `(document kind, document id, amount)` and each is applied
+    /// as an explicit share; the repository's cap refuses a set that exceeds
+    /// `amount`, and refuses it with the figures named.
+    pub async fn record_delivery_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        direction: crate::models::PaymentDirection,
+        party_type: crate::models::PartyType,
+        party_id: i64,
+        method_id: i64,
+        account_id: i64,
+        amount: Decimal,
+        date: NaiveDate,
+        notes: Option<String>,
+        // `movement_description` is the human label for the movement
+        // (`description`). The reference is always the delivery's number; the
+        // description is whatever a person reading a statement should see, which only
+        // the caller knows.
+        movement_description: Option<String>,
+        allocations: &[(crate::models::PartyDocumentKind, i64, Decimal)],
+    ) -> AppResult<crate::models::Payment> {
+        // The no-gap number, inside the caller's unit.
+        let year = date.year();
+        let seq = self.sequences.next_number_in(tx, "PAYMENT", year).await?;
+        let payment_number = crate::models::format_payment_number(year, seq);
+
+        // The cash movement: ONE per delivery, stamped with the delivery's number.
+        // `description` carries the party for a human reading a statement; the
+        // reference is the document the money is traceable to.
+        let movement = self
+            .transactions
+            .create_with_reference_in(
+                tx,
+                actor,
+                account_id,
+                match direction {
+                    crate::models::PaymentDirection::In => crate::models::TransactionKind::Income,
+                    crate::models::PaymentDirection::Out => crate::models::TransactionKind::Expense,
+                },
+                amount,
+                movement_description,
+                Some(payment_number.clone()),
+                date,
+            )
+            .await?;
+
+        let payment = self
+            .payments
+            .create_in(
+                tx,
+                &crate::models::NewPayment {
+                    number: payment_number.clone(),
+                    direction,
+                    party_type,
+                    party_id,
+                    method_id,
+                    account_id,
+                    amount,
+                    date,
+                    notes,
+                    transaction_id: Some(movement.id),
+                    created_by: actor,
+                },
+            )
+            .await?;
+
+        for (kind, target_id, share) in allocations {
+            self.payments
+                .allocate_in(
+                    tx,
+                    &crate::models::NewPaymentAllocation {
+                        payment_id: payment.id,
+                        target_kind: *kind,
+                        target_id: *target_id,
+                        amount: *share,
+                        created_by: actor,
+                    },
+                )
+                .await?;
+        }
+
+        // One ledger entry per payment DOCUMENT (decision 6), not per allocation.
+        self.party_ledger
+            .insert_in(
+                tx,
+                &crate::models::NewPartyLedgerEntry {
+                    party_type,
+                    party_id,
+                    kind: match direction {
+                        crate::models::PaymentDirection::In => {
+                            crate::models::PartyEntryKind::Payment
+                        }
+                        crate::models::PaymentDirection::Out => {
+                            crate::models::PartyEntryKind::Refund
+                        }
+                    },
+                    amount: match direction {
+                        crate::models::PaymentDirection::In => {
+                            crate::models::PartyEntryKind::Payment.signed_amount(amount)
+                        }
+                        crate::models::PaymentDirection::Out => {
+                            crate::models::PartyEntryKind::Refund.signed_amount(amount)
+                        }
+                    },
+                    // The entry names the FIRST document the delivery covers; the
+                    // full set lives in the allocations. A `Payment`/`Refund` entry is
+                    // legitimately multiple per document (migration 43's partial
+                    // index excludes those kinds for exactly that reason), so this is
+                    // a locator, not an identity.
+                    document_kind: allocations
+                        .first()
+                        .map(|(kind, _, _)| *kind)
+                        .unwrap_or(crate::models::PartyDocumentKind::Sale),
+                    document_id: allocations.first().map(|(_, id, _)| *id).unwrap_or(0),
+                    entry_date: date,
+                    reference: Some(payment_number.clone()),
+                    created_by: actor,
+                },
+            )
+            .await?;
+
+        Ok(payment)
     }
 
     // -- Pay (Credit) ------------------------------------------------------------
@@ -1721,88 +1847,23 @@ where
         // together.
         let mut tx = self.sales.pool().begin().await?;
 
-        // 1. The document number, from the no-gap sequence and INSIDE the unit, so
-        // a failure below returns the number instead of burning it.
-        let year = date.year();
-        let seq = self
-            .sequences
-            .next_number_in(&mut tx, "PAYMENT", year)
-            .await?;
-        let payment_number = crate::models::format_payment_number(year, seq);
-
-        // 2. The cash movement. ONE per delivery (decision 5), stamped with the
-        // payment's own number rather than the sale's: the money arrived once and
-        // may cover several documents.
-        let income = self
-            .transactions
-            .create_with_reference_in(
+        // 1-5. The delivery itself: its number, its ONE movement, the share naming
+        // this sale, and the ledger entry — through the ONE writer, so this path and
+        // a multi-sale collection and a cash confirm cannot drift apart.
+        let delivery = self
+            .record_delivery_in(
                 &mut tx,
                 actor,
+                crate::models::PaymentDirection::In,
+                crate::models::PartyType::Customer,
+                sale.customer_id,
+                method_id,
                 account_id,
-                crate::models::TransactionKind::Income,
                 amount,
-                // `description` is the sale on this path (the money is collected
-                // against ONE sale); `reference` is the delivery, which is what the
-                // movement is traceable to.
-                Some(sale_number.clone()),
-                Some(payment_number.clone()),
                 date,
-            )
-            .await?;
-
-        // 3. The payment document, carrying the movement it produced.
-        let payment = self
-            .payments
-            .create_in(
-                &mut tx,
-                &crate::models::NewPayment {
-                    number: payment_number.clone(),
-                    direction: crate::models::PaymentDirection::In,
-                    party_type: crate::models::PartyType::Customer,
-                    party_id: sale.customer_id,
-                    method_id,
-                    account_id,
-                    amount,
-                    date,
-                    notes: None,
-                    transaction_id: Some(income.id),
-                    created_by: actor,
-                },
-            )
-            .await?;
-
-        // 4. The share naming which document this money covers. The cap lives in
-        // the repository (`allocate_in`), which reads the payment and its shares on
-        // THIS connection, so it sees what this unit has already written.
-        self.payments
-            .allocate_in(
-                &mut tx,
-                &crate::models::NewPaymentAllocation {
-                    payment_id: payment.id,
-                    target_kind: crate::models::PartyDocumentKind::Sale,
-                    target_id: sale_id,
-                    amount,
-                    created_by: actor,
-                },
-            )
-            .await?;
-
-        // 5. The party ledger, one entry per payment DOCUMENT (decision 6). The
-        // balance stays one fold; the per-document residual comes from step 4.
-        self.party_ledger
-            .insert_in(
-                &mut tx,
-                &crate::models::NewPartyLedgerEntry {
-                    party_type: crate::models::PartyType::Customer,
-                    party_id: sale.customer_id,
-                    kind: crate::models::PartyEntryKind::Payment,
-                    amount: crate::models::PartyEntryKind::Payment.signed_amount(amount),
-                    document_kind: crate::models::PartyDocumentKind::Sale,
-                    document_id: sale_id,
-                    entry_date: date,
-                    reference: Some(payment_number.clone()),
-                    created_by: actor,
-                },
+                None,
+                Some(sale_number.clone()),
+                &[(crate::models::PartyDocumentKind::Sale, sale_id, amount)],
             )
             .await?;
 
@@ -1818,7 +1879,7 @@ where
                 method_id,
                 amount,
                 date,
-                Some(income.id),
+                delivery.transaction_id,
                 receipt_id,
             )
             .await
