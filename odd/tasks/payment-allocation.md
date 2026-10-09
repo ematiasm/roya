@@ -891,6 +891,40 @@ P8 keeps its other half: re-basing the T1 backfill, which is the LAST reader and
 that will fail with "no such table" if the drop lands first. The
 `allocated_to_target_raw` warning clears only when P6 consumes `allocated_to_target`.
 
+## The journal's kind rule, measured (2026-10-09)
+
+Found while verifying P5.3a. `payment_writer.rs:134-137` chose the entry kind from
+`direction` ALONE (`In => Payment`, `Out => Refund`), which is correct for a CUSTOMER and
+INVERTED for a SUPPLIER. The sign of a party's balance means opposite things by party
+(positive is "the customer owes the shop" but "the SHOP owes the supplier"), so the same
+cash flow needs opposite kinds.
+
+An entry kind says which way the party's OBLIGATION moved, not which way cash moved.
+Derived, then measured with a probe (a credit purchase of 30 paid in full left the
+supplier's balance at **30**, not 0):
+
+| Case | What happened | Correct kind |
+|---|---|---|
+| (Customer, In) | customer pays the shop | `Payment -` |
+| (Customer, Out) | shop refunds the customer | `Refund +` |
+| (Supplier, Out) | shop pays the supplier | **`Payment -`** |
+| (Supplier, In) | supplier refunds the shop | **`Refund +`** |
+
+So `Refund` only when the cash flow is the REVERSE of that party's normal flow, which is
+`(Customer, Out)` or `(Supplier, In)`. The writer needs `party_type` AND `direction`
+together; `PartyEntryKind::signed_amount` (`src/models.rs:3647`) owns the signs and does
+not change. `(Customer, Out)` was already validated end to end by the P5x tests
+(`a_fully_collected_sale_refunded_by_credit_note_folds_to_zero` asserts `Refund +12`).
+
+**The same measurement found a second, separate defect**: `record_payment` (`:1536`) and
+`pay_supplier` (`:1700`) write their OWN `Payment` entry AND call `record_delivery_in`, so
+a supplier payment produced two entries. Both defects have to be fixed together: fixing
+only the writer leaves two `Payment` rows and the balance goes to `-30`; deleting only the
+manual entry leaves `Refund +` and the balance climbs to `60`. The manual block that must
+STAY is the cash leg of `confirm`, which does not use the writer — and that cash leg also
+never created a `payments` row, which is why the residual could not see a cash purchase
+at all.
+
 ## Resume here
 
 1. Read decisions 1–9 above before touching anything: three of them (2, 8, 9) are
