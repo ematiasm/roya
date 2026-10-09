@@ -2,16 +2,16 @@
 
 ## Status
 
-**In progress — P1, P3 (a/b/c/d) and P4 are DONE; P5, P6, P7 and P8 remain.**
-**P5 was re-scoped on 2026-10-09 and then SIMPLIFIED by two user decisions, before any
-code was written.** The re-scope (P5a journal + P5b reads) existed because the ledger
-did not close `balance == Σ residuals − Σ unapplied`. Two decisions removed that reason:
-the legacy dual-write is **deleted** rather than retired (a), and `cancel` **stops
-existing** as a business action (b), so there is no annulment left to journal. P5 is one
-task again — the reads, the legacy deletion and the `In`-only unapplied fold together —
-because the first fold to break when the legacy rows go is the one being replaced. See
-"P5 blocker" for the evidence and the decisions, and "Relationship" for the wall a
-credit note still hits.
+**In progress — P1, P3 (a/b/c/d), P4, P5.1, P5.2a, P5.2b and P5x are DONE; P5.3, P6, P7
+and P8 remain.** Measured at `7727fa8`: `cargo test --locked` **1567 passed / 0 failed**,
+warnings 80 bin / 55 test. `customer_balance` is `Σ residuals − unapplied_for_party`, and
+the same batch residual feeds the ageing and the statement.
+**Next is P5.3, and it is NOT "delete the writes"**: `sale_payments` still has seven live
+production readers, spelled out under "What P5.3 inherits". See that section and "P5
+blocker" before starting.
+The earlier `feat/party-ledger-p5` / `-p6` branch plan is dropped: the remaining slices go
+in ONE PR on `feat/party-ledger` (tracker PR
+[#150](https://github.com/ematiasm/roya/pull/150), draft, no merge before P8).
 Branch `feat/party-ledger`, all pushed, at `733acc9`. **Tracker PR open as DRAFT, no merge:
 [#150](https://github.com/ematiasm/roya/pull/150)**, on issue
 [#149](https://github.com/ematiasm/roya/issues/149). Do NOT merge before P8: merging with
@@ -820,22 +820,44 @@ decisions.
   sites to this layer, and that drop is the EVIDENCE the wiring is real. Do NOT silence
   it with `allow(dead_code)` and do NOT delete the helper: deleting it breaks
   `allocated_to_target`, which P6 needs.
+- 2026-10-09 — **P5.2b landed** (commit `f5b39ef`) and the wiring proved itself: the
+  full suite is **1567 passed / 0 failed**. `customer_balance` is `Σ residuals −
+  unapplied_for_party`; every set-shaped fold resolves its documents in ONE batch read;
+  the statement is a journal report whose credit rows are payment DELIVERIES
+  (`list_for_party`, one row per document per decision 6) with its debits from the same
+  batch residual, so the running balance still ends at `customer_balance`. Two figures in
+  `over_collection_becomes_the_customers_credit` moved, both derived: `-1` after a 31
+  collection of a 30 sale, and `0` after a second 20 sale collected with 19 (the residual
+  1 offset by the 1 of credit still held; the customer paid 50 for goods worth 50).
+  **One parent error worth recording**, because it cost a delegated writer a `partial`
+  report: the parent told the writer to expect the bin warning count to DROP to 79, and
+  it did not. The criterion was mis-specified. `allocated_to_target_raw` stays dead
+  because the reads call `residuals_for_documents`, not `allocated_to_target`, so the
+  drop never comes from this wiring. What DID become dead is
+  `list_customer_credit_ledger` / `list_confirmed_credit_ledger_all`, which is the change
+  working. A warning-count drop is the right signal when a new symbol is consumed
+  DIRECTLY, not when a layer is inserted in the middle. The count is back to 80/55.
 
-## Resume here
-  code was written.** Exploration measured that the ledger, though written by every
-  path, did not close `balance == Σ residuals − Σ unapplied` (no production path wrote
-  `PartyEntryKind::Cancel`; the sales-cancel refund wrote no entry while its
-  purchase-cancel mirror wrote one; an applied credit is deliberately invisible to the
-  journal; the legacy rows were still written on purpose). A first revision of "P5
-  blocker" blamed the SIGN of `Refund` and was WRONG — the correction is recorded in
-  place, because the wrong version is the one a future reader re-derives. The user then
-  (a) deleted the legacy dual-write outright instead of retiring it in P8, since the dev
-  database is wiped, and (b) retired `cancel` as a business action entirely, a Confirmed
-  document being corrected with a mirror document. Together those removed the journal
-  blocker, so P5 is one task again and `cancel`'s retirement is a separate feature. A
-  third decision closed the wall a Confirmed credit note hit: it is corrected by
-  REASSIGNING money, not by annulling it. Nothing was implemented; the two stacked
-  branches (`feat/party-ledger-p5`/`-p6`) were dropped for one PR on `feat/party-ledger`.
+## What P5.3 inherits, measured — `sale_payments` is NOT unread
+
+The grep a legacy deletion needs, run at `f5b39ef`. **This is why the legacy writes
+cannot simply be deleted**, and it is the real content of P5.3:
+
+- `list_customer_credit_ledger` (`sale_repo.rs:853` holds its `sale_payments` SELECT)
+  and `list_confirmed_credit_ledger_all` are now DEAD: no call sites anywhere in `src/`.
+  The reads stopped asking for them, which is what made the folds above possible.
+- `sale_payments` still has LIVE production readers: `sale_repo.rs:1312` (a document's
+  payment rows), `:1325` (payment lookup), `:1336` (receipt payment rows), `:1480`
+  (payment document listing), `:1551` (receipt allocation totals), `party_ledger_repo.rs:468`
+  (the T1 backfill, which P8 re-bases) and `transaction.rs:472` (refund metadata lookup).
+- `self.sales.list_payments(` is still called in `sales.rs` for the DETAIL view (a record
+  page showing its own payments) at `:445`, `:653`, `:685`, `:953` and `:2025`. Those are
+  legitimately out of P5's scope, and they are the reason the writes survive it.
+
+So P5.3 is not "delete the writes": it is "move the detail/record payment rows and the
+receipt totals onto `payments` + `payment_allocations`, then delete the writes, then let
+the two dead ledger methods go with them." The `allocated_to_target_raw` warning clears
+only when P6 consumes `allocated_to_target`.
 
 ## Resume here
 
