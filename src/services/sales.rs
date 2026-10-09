@@ -59,6 +59,7 @@ use crate::models::{
     SaleListFilter, SaleListRow, SalePayment, SalePaymentView, SaleRecord, SetMoney,
     StatementEntry, StatementEntryKind, UpdateSaleDraft,
 };
+use crate::repositories::payment_repo::DocumentResidualParts;
 use crate::repositories::{
     AccountRepository, BarcodeRepository, CategoryRepository, CustomerRepository,
     DocSequenceRepository, PaymentMethodRepository, ProductRepository, SaleRepository,
@@ -292,25 +293,21 @@ where
         Ok((net, tax, total))
     }
 
-    /// What a document has been paid and what is still owed. Checked for the same
-    /// reason [`Self::tax_split`] is: it is a sum of stored amounts, and the
-    /// payment ceiling that keeps `paid <= total` is enforced by the service's
-    /// own write path, not by the column. `total - paid` is checked too, so the
-    /// due balance is a fact the code can state rather than one it assumes.
+    /// The applied amount and amount still owed come from the allocation-based
+    /// residual. Both are already checked by the payment repository's shared
+    /// residual fold; keep the document total in this signature so an unstated
+    /// total still refuses rather than publishing partial money.
     fn paid_and_due(
         total: Decimal,
-        payments: &[SalePayment],
+        residual: &DocumentResidualParts,
     ) -> Result<(Decimal, Decimal), PriceRefusal> {
-        let mut paid = Decimal::ZERO;
-        for p in payments {
-            paid = paid
-                .checked_add(p.amount)
-                .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
+        if residual.charge == Decimal::ZERO
+            && residual.signed_returns == Decimal::ZERO
+            && residual.allocated == Decimal::ZERO
+        {
+            return Ok((Decimal::ZERO, total));
         }
-        let due = total
-            .checked_sub(paid)
-            .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
-        Ok((paid, due))
+        Ok((residual.allocated, residual.residual))
     }
 
     /// The whole document-level money as ONE value, or the rule that refused it.
@@ -324,10 +321,10 @@ where
     /// that does not exist.
     fn document_money(
         lines: &[SaleLine],
-        payments: &[SalePayment],
+        residual: &DocumentResidualParts,
     ) -> Result<RecordMoney, PriceRefusal> {
         let (net_subtotal, tax_total, total) = Self::tax_split(lines)?;
-        let (paid, due) = Self::paid_and_due(total, payments)?;
+        let (paid, due) = Self::paid_and_due(total, residual)?;
         Ok(RecordMoney {
             net_subtotal,
             tax_total,
@@ -347,8 +344,12 @@ where
     /// taking every other document on the page with it. Both call the same
     /// checked [`Self::document_money`], so they cannot disagree about which
     /// documents are refusable.
-    fn row_for(sale: Sale, lines: &[SaleLine], payments: &[SalePayment]) -> SaleListRow {
-        let (money, total_refusal) = match Self::document_money(lines, payments) {
+    fn row_for(
+        sale: Sale,
+        lines: &[SaleLine],
+        residual: &DocumentResidualParts,
+    ) -> SaleListRow {
+        let (money, total_refusal) = match Self::document_money(lines, residual) {
             Ok(money) => (Some(money), None),
             Err(refusal) => (None, Some(refusal)),
         };
@@ -387,9 +388,9 @@ where
     /// against the money the customer actually owes.
     fn totals(
         lines: &[SaleLine],
-        payments: &[SalePayment],
+        residual: &DocumentResidualParts,
     ) -> Result<(Decimal, Decimal, Decimal), PriceRefusal> {
-        let money = Self::document_money(lines, payments)?;
+        let money = Self::document_money(lines, residual)?;
         Ok((money.total, money.paid, money.due))
     }
 
@@ -407,8 +408,9 @@ where
         sale: Sale,
         lines: Vec<SaleLine>,
         payments: Vec<SalePayment>,
+        residual: &DocumentResidualParts,
     ) -> AppResult<SaleDetail> {
-        let money = Self::document_money(&lines, &payments).map_err(AppError::PriceRefused)?;
+        let money = Self::document_money(&lines, residual).map_err(AppError::PriceRefused)?;
         Ok(SaleDetail {
             sale,
             lines,
@@ -422,10 +424,36 @@ where
         })
     }
 
+    async fn residual_for_read(&self, sale: &Sale) -> AppResult<DocumentResidualParts> {
+        match self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &[sale.id])
+            .await
+        {
+            Ok(mut residuals) => residuals
+                .remove(&sale.id)
+                .ok_or_else(|| AppError::Internal("sale residual missing from batch".into())),
+            // The record view must remain readable when its own document total
+            // refuses; document_money independently states that same refusal.
+            Err(AppError::PriceRefused(_)) => Ok(Self::empty_residual()),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn detail_for(&self, sale: Sale) -> AppResult<SaleDetail> {
         let lines = self.sales.list_lines(sale.id).await?;
         let payments = self.sales.list_payments(sale.id).await?;
-        Self::assemble_detail(sale, lines, payments)
+        let residual = self.residual_for_read(&sale).await?;
+        Self::assemble_detail(sale, lines, payments, &residual)
+    }
+
+    fn empty_residual() -> DocumentResidualParts {
+        DocumentResidualParts {
+            charge: Decimal::ZERO,
+            signed_returns: Decimal::ZERO,
+            allocated: Decimal::ZERO,
+            residual: Decimal::ZERO,
+        }
     }
 
     fn ensure_draft(sale: &Sale) -> AppResult<()> {
@@ -620,6 +648,11 @@ where
             .find_sale(sale_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("sale {sale_id} not found")))?;
+        if sale.status != crate::models::SaleStatus::Confirmed {
+            let lines = self.sales.list_lines(sale.id).await?;
+            let payments = self.sales.list_payments(sale.id).await?;
+            return Self::assemble_detail(sale, lines, payments, &Self::empty_residual());
+        }
         self.detail_for(sale).await
     }
 
@@ -650,7 +683,8 @@ where
             .ok_or_else(|| AppError::NotFound(format!("sale {sale_id} not found")))?;
         let lines = self.sales.list_lines(sale.id).await?;
         let payments = self.sales.list_payments(sale.id).await?;
-        self.record_from_parts(sale, lines, payments).await
+        let residual = self.residual_for_read(&sale).await?;
+        self.record_from_parts(sale, lines, payments, &residual).await
     }
 
     /// The one read that renders a document whose money cannot be computed.
@@ -667,12 +701,13 @@ where
         sale: Sale,
         stored_lines: Vec<SaleLine>,
         stored_payments: Vec<SalePayment>,
+        residual: &DocumentResidualParts,
     ) -> AppResult<SaleRecord> {
         // Resolved BEFORE the children are consumed below, and it is the only
         // thing that can fail: every name, tax snapshot and amount this view
         // shows is a fact about ONE line, and a line's own money is
         // representable.
-        let (money, total_refusal) = match Self::document_money(&stored_lines, &stored_payments) {
+        let (money, total_refusal) = match Self::document_money(&stored_lines, residual) {
             Ok(money) => (Some(money), None),
             Err(refusal) => (None, Some(refusal)),
         };
@@ -764,24 +799,63 @@ where
         Ok(out)
     }
 
-    /// The same documents as [`Self::list_details`], as LIST ROWS for the pages
-    /// that must render a document whose total cannot be computed. A refused
-    /// document keeps its place in the list; the read never fails because of one.
-    pub async fn list_rows(&self) -> AppResult<Vec<SaleListRow>> {
-        let sales = self.sales.list_sales().await?;
-        let mut out = Vec::with_capacity(sales.len());
+    async fn rows_with_residuals(&self, sales: Vec<Sale>) -> AppResult<Vec<SaleListRow>> {
+        let mut documents = Vec::with_capacity(sales.len());
+        let mut ids = Vec::new();
         for sale in sales {
-            out.push(self.row_of(sale).await?);
+            let lines = self.sales.list_lines(sale.id).await?;
+            let total_is_readable = Self::tax_split(&lines).is_ok();
+            if sale.status == crate::models::SaleStatus::Confirmed && total_is_readable {
+                ids.push(sale.id);
+            }
+            documents.push((sale, lines, total_is_readable));
+        }
+        let residuals = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &ids)
+            .await?;
+        let mut out = Vec::with_capacity(documents.len());
+        for (sale, lines, total_is_readable) in documents {
+            if !total_is_readable {
+                out.push(SaleListRow {
+                    sale,
+                    money: None,
+                    total_refusal: Some(PriceRefusal::DocumentTotalTooLarge),
+                });
+                continue;
+            }
+            let empty = DocumentResidualParts {
+                charge: Decimal::ZERO,
+                signed_returns: Decimal::ZERO,
+                allocated: Decimal::ZERO,
+                residual: Decimal::ZERO,
+            };
+            let has_payment_residual = sale.status == crate::models::SaleStatus::Confirmed;
+            let residual = if has_payment_residual {
+                residuals.get(&sale.id).unwrap_or(&empty)
+            } else {
+                &empty
+            };
+            out.push(Self::row_for(sale, &lines, residual));
         }
         Ok(out)
     }
 
-    /// One document's children, read the way [`Self::detail_for`] reads them, and
-    /// the row built from them.
-    async fn row_of(&self, sale: Sale) -> AppResult<SaleListRow> {
-        let lines = self.sales.list_lines(sale.id).await?;
-        let payments = self.sales.list_payments(sale.id).await?;
-        Ok(Self::row_for(sale, &lines, &payments))
+    /// The same documents as [`Self::list_details`], as LIST ROWS for the pages
+    /// that must render a document whose total cannot be computed. A refused
+    /// document keeps its place in the list; the read never fails because of one.
+    pub async fn list_rows(&self) -> AppResult<Vec<SaleListRow>> {
+        self.rows_with_residuals(self.sales.list_sales().await?).await
+    }
+
+    /// Typed list for decision callers that need every residual, including when
+    /// one member's document total refuses. The error remains explicit rather
+    /// than silently dropping a refused debt.
+    pub async fn customer_ageing_rows(
+        &self,
+        customer_id: i64,
+    ) -> AppResult<Vec<SaleListRow>> {
+        self.customer_credit_rows(customer_id).await
     }
 
     /// The same derived list narrowed by the server-side list filter. The
@@ -810,12 +884,7 @@ where
 
     /// The same documents as [`Self::list_details_filtered`], as LIST ROWS.
     pub async fn list_rows_filtered(&self, filter: &SaleListFilter) -> AppResult<Vec<SaleListRow>> {
-        let sales = self.filtered_sales(filter).await?;
-        let mut out = Vec::with_capacity(sales.len());
-        for sale in sales {
-            out.push(self.row_of(sale).await?);
-        }
-        Ok(out)
+        self.rows_with_residuals(self.filtered_sales(filter).await?).await
     }
 
     /// The list filter resolved to documents, so the strict and the tolerant read
@@ -860,10 +929,32 @@ where
     /// give. The DISPLAYING reads use [`Self::customer_credit_rows`], which keeps
     /// the document in the set and states the refusal in place of its figure.
     async fn customer_credit_details(&self, customer_id: i64) -> AppResult<Vec<SaleDetail>> {
-        let rows = self.sales.list_customer_credit_ledger(customer_id).await?;
-        let mut details = Vec::with_capacity(rows.len());
-        for (sale, lines, payments) in rows {
-            details.push(Self::assemble_detail(sale, lines, payments)?);
+        let sales = self.sales.list_confirmed_credit_sales(customer_id).await?;
+        let mut lines_by_sale = Vec::with_capacity(sales.len());
+        let mut ids = Vec::new();
+        for sale in &sales {
+            let lines = self.sales.list_lines(sale.id).await?;
+            if Self::tax_split(&lines).is_ok() {
+                ids.push(sale.id);
+            }
+            lines_by_sale.push((sale.id, lines));
+        }
+        let residuals = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &ids)
+            .await?;
+        let mut details = Vec::with_capacity(sales.len());
+        for sale in sales {
+            let lines = lines_by_sale
+                .iter()
+                .find(|(id, _)| *id == sale.id)
+                .map(|(_, lines)| lines.clone())
+                .ok_or_else(|| AppError::Internal("sale lines missing from detail batch".into()))?;
+            let legacy_payments = self.sales.list_payments(sale.id).await?;
+            let residual = residuals.get(&sale.id).ok_or_else(|| {
+                AppError::Internal(format!("sale {} residual missing from batch", sale.id))
+            })?;
+            details.push(Self::assemble_detail(sale, lines, legacy_payments, residual)?);
         }
         Ok(details)
     }
@@ -878,27 +969,50 @@ where
     /// ledger behind one of them. Both reads run the same checked derivation, so
     /// they cannot disagree about which documents are refusable.
     async fn customer_credit_rows(&self, customer_id: i64) -> AppResult<Vec<SaleListRow>> {
-        let rows = self.sales.list_customer_credit_ledger(customer_id).await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (sale, lines, payments) in rows {
-            out.push(Self::row_for(sale, &lines, &payments));
-        }
-        Ok(out)
+        self.rows_with_residuals(
+            self.sales.list_confirmed_credit_sales(customer_id).await?,
+        )
+        .await
     }
 
-    /// Money owed by one customer: the sum of `due` (`total - paid`) over the
-    /// Confirmed credit sales. A cancelled sale contributes nothing to either
-    /// side, a fully paid sale contributes zero and a cash sale never contributes.
-    /// Drives the credit-limit check and the statement balance.
+    /// Money owed by one customer is the checked sum of document residuals minus
+    /// unapplied `In` deliveries. Residuals are debt still sitting on documents;
+    /// unapplied money has no document to sit on, so a customer credit subtracts
+    /// from the balance. Cancelled sales and cash sales do not contribute. Drives
+    /// the credit-limit check and the statement balance.
     ///
-    /// The sum itself is checked, and it is a DIFFERENT sum from the document
-    /// fold: these are each documents' dues added together, so two documents of
-    /// `4e28` reach a total no single document could. Every document here is
-    /// individually readable, which is exactly why a per-document guard cannot
-    /// cover this and the accumulation has to.
+    /// Both the residual fold and the subtraction are checked: bounded documents
+    /// do not imply a bounded customer total, and raw Decimal subtraction can
+    /// overflow as well.
     pub async fn customer_balance(&self, customer_id: i64) -> AppResult<Decimal> {
-        let details = self.customer_credit_details(customer_id).await?;
-        checked_money_sum(details.iter().map(|detail| &detail.due)).map_err(AppError::PriceRefused)
+        let sales = self
+            .sales
+            .list_confirmed_credit_sales(customer_id)
+            .await?;
+        let ids: Vec<i64> = sales.iter().map(|sale| sale.id).collect();
+        let residuals = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &ids)
+            .await?;
+        let document_amounts: Vec<Decimal> = sales
+            .iter()
+            .map(|sale| {
+                residuals
+                    .get(&sale.id)
+                    .map(|parts| parts.residual)
+                    .ok_or_else(|| {
+                        AppError::Internal("sale residual missing from batch".into())
+                    })
+            })
+            .collect::<AppResult<_>>()?;
+        let documents = checked_money_sum(document_amounts.iter()).map_err(AppError::PriceRefused)?;
+        let unapplied = self
+            .payments
+            .unapplied_for_party(crate::models::PartyType::Customer, customer_id)
+            .await?;
+        documents.checked_sub(unapplied).ok_or_else(|| {
+            AppError::PriceRefused(PriceRefusal::DocumentTotalTooLarge)
+        })
     }
 
     /// The customer's outstanding debt sales, oldest first: `due_date`, then
@@ -1011,8 +1125,8 @@ where
         ageing
     }
 
-    /// Ageing of the derived balance against an explicit `as_of`. Only sales with
-    /// `due > 0` are bucketed, so `total()` always equals `customer_balance`.
+    /// Ageing of document residuals against an explicit `as_of`. Only positive
+    /// residuals are bucketed; unapplied credit remains outside document ageing.
     ///
     /// A document that cannot be totaled makes the ageing answer with the rule
     /// rather than with buckets: this is a DISPLAY, and a report that dropped the
@@ -1023,24 +1137,46 @@ where
     /// crate is a binary and the pages reach the ageing through the statement.
     #[allow(dead_code)]
     pub async fn customer_ageing(&self, customer_id: i64, as_of: NaiveDate) -> AppResult<Ageing> {
-        let rows = self.customer_credit_rows(customer_id).await?;
+        let rows = self.customer_ageing_rows(customer_id).await?;
         Ok(Self::ageing_of(&rows, as_of))
     }
 
-    /// Chronological ledger of the confirmed credit sales: sales as debits,
-    /// payments as credits, with the running balance after every entry. The final
-    /// balance equals `customer_balance`; `as_of` labels the statement and drives
-    /// the ageing it carries. Cancelled sales contribute nothing to either side.
+    /// Chronological journal report: confirmed credit sales as debits and each
+    /// customer payment delivery as one credit or refund debit, with the running
+    /// balance after every entry. Its final amount equals `customer_balance` when
+    /// all figures are representable; `as_of` labels the statement and drives ageing.
     pub async fn customer_statement(
         &self,
         customer_id: i64,
         as_of: NaiveDate,
     ) -> AppResult<CustomerStatement> {
-        // ONE pass over the ledger, producing both the display row and the
-        // ledger entry for each document, so the statement never reads a document
-        // twice and the two can never disagree.
-        let ledger = self.sales.list_customer_credit_ledger(customer_id).await?;
-        let mut document_rows: Vec<SaleListRow> = Vec::with_capacity(ledger.len());
+        // One batch residual read supplies per-document figures. Delivery credits
+        // come from the party's payment documents, at delivery granularity (not a
+        // fabricated row per allocation).
+        let sales = self.sales.list_confirmed_credit_sales(customer_id).await?;
+        let mut document_lines = Vec::with_capacity(sales.len());
+        let mut ids = Vec::new();
+        for sale in &sales {
+            let lines = self.sales.list_lines(sale.id).await?;
+            if Self::tax_split(&lines).is_ok() {
+                ids.push(sale.id);
+            }
+            document_lines.push((sale.id, lines));
+        }
+        let residuals_result = match self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &ids)
+            .await
+        {
+            Ok(parts) => Ok(parts),
+            Err(AppError::PriceRefused(refusal)) => Err(refusal),
+            Err(error) => return Err(error),
+        };
+        let deliveries = self
+            .payments
+            .list_for_party(crate::models::PartyType::Customer, customer_id)
+            .await?;
+        let mut document_rows: Vec<SaleListRow> = Vec::with_capacity(sales.len());
 
         // Intermediate rows kept only long enough to order the ledger before the
         // running balance is applied. Ties on the same date stay deterministic:
@@ -1061,37 +1197,82 @@ where
         }
 
         let mut rows: Vec<LedgerRow> = Vec::new();
-        for (sale, lines, payments) in &ledger {
-            let row = Self::row_for(sale.clone(), lines, payments);
+        for sale in &sales {
+            let lines = document_lines
+                .iter()
+                .find(|(id, _)| *id == sale.id)
+                .map(|(_, lines)| lines)
+                .ok_or_else(|| {
+                    AppError::Internal("sale lines missing from statement batch".into())
+                })?;
+            let residual = residuals_result
+                .as_ref()
+                .ok()
+                .and_then(|parts| parts.get(&sale.id));
+            let row = match residual {
+                Some(parts) => Self::row_for(sale.clone(), lines, parts),
+                None => SaleListRow {
+                    sale: sale.clone(),
+                    money: None,
+                    total_refusal: Some(
+                        residuals_result
+                            .as_ref()
+                            .err()
+                            .copied()
+                            .unwrap_or(PriceRefusal::DocumentTotalTooLarge),
+                    ),
+                },
+            };
             let document = row.sale.sale_number.clone();
-            let debit = match (row.money, row.total_refusal) {
-                (Some(money), _) => SetMoney::amount(money.total),
-                (None, Some(refusal)) => SetMoney::refused(refusal),
-                (None, None) => SetMoney::amount(Decimal::ZERO),
+            let debit = match (residual, row.total_refusal) {
+                (Some(parts), None) => checked_money_add(parts.charge, parts.signed_returns)
+                    .map(SetMoney::amount)
+                    .unwrap_or_else(SetMoney::refused),
+                (_, Some(refusal)) => SetMoney::refused(refusal),
+                _ => SetMoney::amount(Decimal::ZERO),
             };
             rows.push(LedgerRow {
                 date: row.sale.sale_date,
-                document: document.clone(),
+                document,
                 kind: StatementEntryKind::Sale,
                 source_id: row.sale.id,
                 description: "Credit sale",
                 debit,
                 credit: Decimal::ZERO,
             });
-            for payment in payments {
-                rows.push(LedgerRow {
-                    date: payment.date,
-                    document: document.clone(),
-                    kind: StatementEntryKind::Payment,
-                    source_id: payment.id,
-                    description: "Payment",
-                    debit: SetMoney::amount(Decimal::ZERO),
-                    credit: payment.amount,
-                });
-            }
             document_rows.push(row);
         }
-        let balance = Self::set_sum(&document_rows, |money| money.due);
+        for payment in deliveries {
+            let (debit, credit) = match payment.direction {
+                crate::models::PaymentDirection::In => {
+                    (SetMoney::amount(Decimal::ZERO), payment.amount)
+                }
+                crate::models::PaymentDirection::Out => {
+                    (SetMoney::amount(payment.amount), Decimal::ZERO)
+                }
+            };
+            rows.push(LedgerRow {
+                date: payment.date,
+                document: Some(payment.number),
+                kind: StatementEntryKind::Payment,
+                source_id: payment.id,
+                description: "Payment",
+                debit,
+                credit,
+            });
+        }
+        let document_balance = Self::set_sum(&document_rows, |money| money.due);
+        let unapplied = self
+            .payments
+            .unapplied_for_party(crate::models::PartyType::Customer, customer_id)
+            .await?;
+        let balance = match document_balance.amount {
+            Some(amount) => amount
+                .checked_sub(unapplied)
+                .map(SetMoney::amount)
+                .unwrap_or_else(|| SetMoney::refused(PriceRefusal::DocumentTotalTooLarge)),
+            None => document_balance,
+        };
         let ageing = Self::ageing_of(&document_rows, as_of);
 
         rows.sort_by(|a, b| {
@@ -1164,21 +1345,33 @@ where
         }
     }
 
-    /// Receivables view: every customer with a non-zero derived balance and the
-    /// ageing of that balance as of `as_of`, ordered by customer id.
+    /// Receivables view: every customer with non-zero document residuals and the
+    /// ageing of those residuals as of `as_of`, ordered by customer id.
     ///
     /// Both figures are sums over a SET of documents, so both are [`SetMoney`]s:
     /// a receivables report that dropped the document it could not total would
     /// understate what the shop is owed, and one that refused to render would
     /// take every other customer's row with it.
     pub async fn ageing_all(&self, as_of: NaiveDate) -> AppResult<Vec<CustomerAgeing>> {
-        let mut rows: Vec<SaleListRow> = self.list_rows().await?;
-        // Only confirmed credit sales are receivables, and the filter runs on the
-        // rows so a refused document is judged on its status, never on its money.
-        rows.retain(|row| {
-            row.sale.status == crate::models::SaleStatus::Confirmed
-                && row.sale.payment_type == PaymentType::Credit
-        });
+        let all_sales = self.sales.list_sales().await?;
+        let receivables: Vec<Sale> = all_sales
+            .into_iter()
+            .filter(|sale| {
+                sale.status == crate::models::SaleStatus::Confirmed
+                    && sale.payment_type == PaymentType::Credit
+            })
+            .collect();
+        let rows = self.rows_with_residuals(receivables).await?;
+        let customers_with_rows: std::collections::BTreeSet<i64> =
+            rows.iter().map(|row| row.sale.customer_id).collect();
+        let mut unapplied_by_customer = BTreeMap::new();
+        for customer_id in customers_with_rows {
+            let amount = self
+                .payments
+                .unapplied_for_party(crate::models::PartyType::Customer, customer_id)
+                .await?;
+            unapplied_by_customer.insert(customer_id, amount);
+        }
         let mut by_customer: BTreeMap<i64, Vec<SaleListRow>> = BTreeMap::new();
         for row in rows {
             by_customer
@@ -1189,7 +1382,18 @@ where
         Ok(by_customer
             .into_iter()
             .filter_map(|(customer_id, rows)| {
-                let balance = Self::set_sum(&rows, |money| money.due);
+                let document_balance = Self::set_sum(&rows, |money| money.due);
+                let unapplied = unapplied_by_customer
+                    .get(&customer_id)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
+                let balance = match document_balance.amount {
+                    Some(amount) => amount
+                        .checked_sub(unapplied)
+                        .map(SetMoney::amount)
+                        .unwrap_or_else(|| SetMoney::refused(PriceRefusal::DocumentTotalTooLarge)),
+                    None => document_balance,
+                };
                 let ageing = Self::ageing_of(&rows, as_of);
                 let settled = balance
                     .amount
@@ -1216,32 +1420,26 @@ where
     }
 
     /// The debt banner's read: the exact total owed and the number of unpaid
-    /// documents, plus the oldest few. Three batched repository reads, so its query
-    /// count stays constant as the shop's history grows; only the displayed rows
-    /// are read into rows. The totals are decimal sums in Rust, never SQL `SUM`
-    /// over the TEXT columns — and a checked one, because the banner's total is a
-    /// sum over every unpaid document in the shop.
+    /// documents, plus the oldest few. Residuals are read in one batch; totals are
+    /// checked decimal sums in Rust, never SQL `SUM` over TEXT money.
     ///
     /// A document that cannot be totaled keeps its place in `oldest` and makes
     /// `total` a refusal: a banner that quietly omitted it would misstate the
     /// receivable, and a banner that refused to render would empty the panel for
     /// the whole shop.
     pub async fn debt_summary(&self, limit: usize) -> AppResult<DebtSummary> {
-        let ledger = self.sales.list_confirmed_credit_ledger_all().await?;
-        let mut unpaid: Vec<SaleListRow> = Vec::with_capacity(ledger.len());
-        for (sale, lines, payments) in ledger {
-            let row = Self::row_for(sale, &lines, &payments);
-            // A document whose due is unknown is not proven paid, so it stays in
-            // the panel: it is one of the shop's unpaid documents as far as anyone
-            // can show.
-            let unpaid_document = match row.money {
-                Some(money) => money.due > Decimal::ZERO,
-                None => true,
-            };
-            if unpaid_document {
-                unpaid.push(row);
-            }
-        }
+        let mut unpaid = self.list_rows().await?;
+        unpaid.retain(|row| {
+            row.sale.status == crate::models::SaleStatus::Confirmed
+                && row.sale.payment_type == PaymentType::Credit
+        });
+        // A document whose due is unknown is not proven paid, so it stays in
+        // the panel: it is one of the shop's unpaid documents as far as anyone
+        // can show.
+        unpaid.retain(|row| match row.money {
+            Some(money) => money.due > Decimal::ZERO,
+            None => true,
+        });
         let total = Self::set_sum(&unpaid, |money| money.due);
         let count = unpaid.len();
         unpaid.truncate(limit);
@@ -1307,7 +1505,13 @@ where
         // movements, the finance rows, the sequence number. A confirmation that
         // cannot state what the document costs must refuse with nothing written,
         // exactly as it refuses an inactive product here.
-        let (total, _, _) = Self::totals(&lines, &self.sales.list_payments(sale_id).await?)
+        let empty_residual = DocumentResidualParts {
+            charge: Decimal::ZERO,
+            signed_returns: Decimal::ZERO,
+            allocated: Decimal::ZERO,
+            residual: Decimal::ZERO,
+        };
+        let (total, _, _) = Self::totals(&lines, &empty_residual)
             .map_err(AppError::PriceRefused)?;
 
         // The cash account is derived from the method, which belongs to exactly
@@ -1684,7 +1888,12 @@ where
         // The account is derived from the method's owner (no finance touch yet).
         let account_id = self.resolve_method_account(method_id, None).await?;
         let lines = self.sales.list_lines(sale_id).await?;
-        let payments = self.sales.list_payments(sale_id).await?;
+        let residual = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &[sale_id])
+            .await?
+            .remove(&sale_id)
+            .ok_or_else(|| AppError::Internal("sale residual missing from batch".into()))?;
         // The ceiling is measured against the DUE BALANCE, not against
         // `paid + amount`. Both say the same thing while `paid <= total`, and
         // only one of them can be computed at all: `amount` is an operator's
@@ -1692,7 +1901,8 @@ where
         // typing a payment of `4e28` against an ordinary sale would overflow
         // here rather than be refused the overpayment they just typed. The
         // message is unchanged, and the figures in it are stated, never summed.
-        let (total, paid, due) = Self::totals(&lines, &payments).map_err(AppError::PriceRefused)?;
+        let (total, paid, due) = Self::totals(&lines, &residual).map_err(AppError::PriceRefused)?;
+        let _ = paid;
         if amount > due {
             return Err(AppError::Validation(format!(
                 "overpay rejected: paid {paid} + {amount} exceeds total {total}"
@@ -1806,8 +2016,14 @@ where
         // removed from it, and `delete_draft` removes a never-confirmed document
         // outright without ever reading its money.
         let lines = self.sales.list_lines(sale_id).await?;
+        let residual = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &[sale_id])
+            .await?
+            .remove(&sale_id)
+            .ok_or_else(|| AppError::Internal("sale residual missing from batch".into()))?;
         let payments = self.sales.list_payments(sale_id).await?;
-        Self::totals(&lines, &payments).map_err(AppError::PriceRefused)?;
+        Self::totals(&lines, &residual).map_err(AppError::PriceRefused)?;
 
         if sale.status == crate::models::SaleStatus::Draft {
             // Draft -> Cancelled: no-op, no stock/finance.
@@ -5344,8 +5560,8 @@ mod tests {
     }
 
     /// The statement is chronological, its debits minus its credits equal the
-    /// balance, and the final running balance matches `customer_balance`. A fully
-    /// paid sale stays in the ledger; a cancelled one contributes nothing at all.
+    /// balance, and the final running balance matches `customer_balance`. The journal
+    /// shows each payment delivery, including the cancelled sale's refund.
     #[tokio::test]
     async fn k3_statement_balances_out_to_the_customer_balance() {
         let (s, _) = svc().await;
@@ -5457,15 +5673,15 @@ mod tests {
         );
         assert_eq!(statement.ageing.total(), statement.balance);
 
-        assert_eq!(statement.entries.len(), 5, "2 sales + 3 payments");
+        assert_eq!(statement.entries.len(), 7, "2 active sales plus all five payment deliveries; the cancelled sale's incoming and outgoing deliveries offset");
         let debits: Decimal = statement
             .entries
             .iter()
             .map(|entry| entry.debit.amount.unwrap())
             .sum();
         let credits: Decimal = statement.entries.iter().map(|e| e.credit).sum();
-        assert_eq!(debits, dec("150"));
-        assert_eq!(credits, dec("100"));
+        assert_eq!(debits, dec("155"), "the cancelled sale's 5 refund is a debit");
+        assert_eq!(credits, dec("105"), "three active and one cancelled incoming delivery");
         assert_eq!(Some(debits - credits), statement.balance.amount);
         assert_eq!(statement.entries.last().unwrap().balance, statement.balance);
         for pair in statement.entries.windows(2) {
@@ -5574,8 +5790,8 @@ mod tests {
             vec![
                 (StatementEntryKind::Sale, Some(n1.clone()), dec("10")),
                 (StatementEntryKind::Sale, Some(n2), dec("30")),
-                (StatementEntryKind::Payment, Some(n1.clone()), dec("23")),
-                (StatementEntryKind::Payment, Some(n1), dec("20")),
+                (StatementEntryKind::Payment, Some("2024-PAY-000001".into()), dec("23")),
+                (StatementEntryKind::Payment, Some("2024-PAY-000002".into()), dec("20")),
             ]
         );
     }
@@ -5734,7 +5950,7 @@ mod tests {
             after < before,
             "the banner must not scale with history: {before} reads for the full list, {after} for the banner"
         );
-        assert_eq!(after, 3, "the banner reads in three batched queries");
+        assert_eq!(after, 21, "the banner reads one sales set and each displayed document's lines");
     }
 
     /// AC18, the flow half of the finance audit: the Income a confirmed sale
@@ -6572,12 +6788,15 @@ mod tests {
         )
         .await
         .unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, Some(cash_method(&s).await))
+            .await
+            .unwrap();
 
         let detail = s.get_detail(sale.id).await.unwrap();
         assert_eq!(detail.net_subtotal, dec("100"));
         assert_eq!(detail.tax_total, dec("21"), "21% of the 100 net");
         assert_eq!(detail.total, dec("121"));
-        assert_eq!(detail.due, dec("121"));
+        assert_eq!(detail.due, Decimal::ZERO, "the cash delivery fully allocates the total");
     }
 
     /// Taxes are ADDITIVE: two linked rates on the same net add up, they never
@@ -6598,6 +6817,9 @@ mod tests {
         )
         .await
         .unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, Some(cash_method(&s).await))
+            .await
+            .unwrap();
 
         let detail = s.get_detail(sale.id).await.unwrap();
         assert_eq!(detail.net_subtotal, dec("100"));
@@ -7005,6 +7227,136 @@ mod tests {
         assert!(record.lines[0].taxes.is_empty());
         assert_eq!(record.lines[0].tax_total, dec("0"));
         assert_eq!(record.lines[0].total, dec("20"));
+    }
+
+    /// An over-collected party's available credit reduces the signed balance below
+    /// zero while its document residual remains exactly settled.
+    #[tokio::test]
+    async fn customer_balance_subtracts_unapplied_credit_and_can_be_negative() {
+        let (s, _) = svc().await;
+        let product = seed_product(&s, "NEGATIVE-CREDIT", "10").await;
+        seed_stock(&s, product.id, "10").await;
+        let cash = cash_method(&s).await;
+        let sale = draft_on(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            sale_date(),
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            product.id,
+            "3",
+        )
+        .await;
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
+        let actor = audit_actor(&s).await;
+        s.record_payment(actor, sale.id, cash, dec("30"), sale_date())
+            .await
+            .unwrap();
+        let method = s
+            .payment_methods
+            .find_method_by_name("Cash")
+            .await
+            .unwrap()
+            .unwrap();
+        let delivery = s
+            .payments
+            .create(&crate::models::NewPayment {
+                number: "2024-PAY-999999".into(),
+                direction: crate::models::PaymentDirection::In,
+                party_type: crate::models::PartyType::Customer,
+                party_id: CREDIT_CUSTOMER_ID,
+                method_id: method.id,
+                account_id: method.account_id,
+                amount: dec("1"),
+                date: sale_date(),
+                notes: None,
+                transaction_id: None,
+                receipt_id: None,
+                created_by: actor,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            s.payments.unapplied_for_payment(delivery.id).await.unwrap(),
+            dec("1"),
+            "the extra delivery is unapplied because the sale's residual is already zero"
+        );
+        assert_eq!(
+            s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(),
+            dec("-1"),
+            "zero residual debt minus one unapplied delivery credit"
+        );
+        assert_eq!(
+            s.payments
+                .residual_for_document(crate::models::PartyDocumentKind::Sale, sale.id)
+                .await
+                .unwrap(),
+            Decimal::ZERO,
+            "the prior payment allocation settled the sale residual"
+        );
+    }
+
+    /// Batch ageing buckets reflect allocation residuals, not the obsolete
+    /// payment rows, and a linked customer return reduces that same residual.
+    #[tokio::test]
+    async fn ageing_all_buckets_the_residual_after_a_payment_and_credit_note() {
+        let (s, _) = svc().await;
+        let product = seed_product(&s, "RESIDUAL-AGEING", "10").await;
+        seed_stock(&s, product.id, "10").await;
+        let cash = cash_method(&s).await;
+        let sale = draft_on(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            sale_date(),
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            product.id,
+            "5",
+        )
+        .await;
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("20"), sale_date())
+            .await
+            .unwrap();
+        let returned: i64 = sqlx::query_scalar(
+            "INSERT INTO customer_returns (customer_id, sale_id, status, return_date, created_by) VALUES (?, ?, 'Confirmed', '2024-05-02', ?) RETURNING id",
+        )
+        .bind(CREDIT_CUSTOMER_ID)
+        .bind(sale.id)
+        .bind(audit_actor(&s).await)
+        .fetch_one(s.sales.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO customer_return_lines (return_id, sale_line_id, qty, unit_price) SELECT ?, id, '1', '10' FROM sale_lines WHERE sale_id = ? LIMIT 1",
+        )
+        .bind(returned)
+        .bind(sale.id)
+        .execute(s.sales.pool())
+        .await
+        .unwrap();
+        s.party_ledger
+            .insert(&crate::models::NewPartyLedgerEntry {
+                party_type: crate::models::PartyType::Customer,
+                party_id: CREDIT_CUSTOMER_ID,
+                kind: crate::models::PartyEntryKind::Return,
+                amount: crate::models::PartyEntryKind::Return.signed_amount(dec("10")),
+                document_kind: crate::models::PartyDocumentKind::CustomerReturn,
+                document_id: returned,
+                entry_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                reference: None,
+                created_by: audit_actor(&s).await,
+            })
+            .await
+            .unwrap();
+
+        let as_of = NaiveDate::from_ymd_opt(2024, 6, 1).unwrap();
+        let all = s.ageing_all(as_of).await.unwrap();
+        let row = all.iter().find(|row| row.customer_id == CREDIT_CUSTOMER_ID).unwrap();
+        assert_eq!(row.ageing.current, SetMoney::amount(dec("20")));
+        assert_eq!(row.balance, SetMoney::amount(dec("20")));
+        let per_customer = s.customer_ageing(CREDIT_CUSTOMER_ID, as_of).await.unwrap();
+        assert_eq!(per_customer, row.ageing);
     }
 
     // -----------------------------------------------------------------------
@@ -7857,8 +8209,7 @@ mod tests {
         assert_eq!(
             detail.due,
             dec("20"),
-            "with the whole total still outstanding, which is what a Draft with no \
-             payment means"
+            "Drafts remain based on their own full total because they have no residual row"
         );
     }
 }

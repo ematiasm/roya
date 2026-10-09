@@ -1026,7 +1026,8 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(dec(&v["balance"]), dec(&json!("20")));
 
-        // The statement now mixes the sale debits with the payment credit.
+        // The statement has one credit row per delivery document (not one per
+        // allocation): the single 60 collection covers two sales but remains one journal row.
         let (st, v) = get(
             &app,
             &format!("/api/customers/{customer}/statement?as_of=2024-07-20"),
@@ -1036,8 +1037,8 @@ mod tests {
         let entries = v["statement"]["entries"].as_array().unwrap();
         assert_eq!(
             entries.len(),
-            4,
-            "two sale debits plus two allocation credits: {entries:?}"
+            3,
+            "two sale debits plus one delivery credit: {entries:?}"
         );
         let credits: Decimal = entries
             .iter()
@@ -1142,17 +1143,13 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
-        // The receivable reflects the FIRST collection only: the over-collection
-        // settled the whole 30 debt, and its extra 1 is credit that this legacy fold
-        // cannot see yet (P5 moves it onto the allocations). So the balance reads 0 and
-        // the rejections below it added nothing.
-        //
-        // The 1 is not lost: it is `unapplied` on the delivery, asserted above.
+        // The residual is zero and the unapplied 1 is customer credit, so the
+        // signed balance is -1; the rejected requests below it added nothing.
         let (_, v) = get(&app, &format!("/api/customers/{customer}")).await;
         assert_eq!(
             dec(&v["balance"]),
-            Decimal::ZERO,
-            "the 30 debt was settled; the 1 of credit waits for P5's fold"
+            dec(&json!("-1")),
+            "the 30 residual is settled and the unapplied 1 is subtracted from the balance"
         );
     }
 
