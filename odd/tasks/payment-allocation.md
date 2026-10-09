@@ -3,7 +3,17 @@
 ## Status
 
 **In progress — P1, P3 (a/b/c/d) and P4 are DONE; P5, P6, P7 and P8 remain.**
-Branch `feat/party-ledger`, all pushed, `origin/feat/party-ledger` at `cac8eb7`.
+Branch `feat/party-ledger`, all pushed, at `733acc9`. **Tracker PR open as DRAFT, no merge:
+[#150](https://github.com/ematiasm/roya/pull/150)**, on issue
+[#149](https://github.com/ematiasm/roya/issues/149). Do NOT merge before P8: merging with
+the legacy tables still in place leaves two homes for the same truth, which is the disease
+this work exists to cure.
+
+**The rest of the chain is TWO STACKED BRANCHES, decided 2026-10-09.** P5 and P6 go on
+`feat/party-ledger-p5` and `feat/party-ledger-p6` (P6 targeting P5, both ultimately onto
+`feat/party-ledger`), each with its own PR — "stacked" resolves the DEPENDENCY (P6 needs
+P5), not the size: together they are ~2.000 lines by this repo's measured authoring rate,
+which is not one reviewable sitting.
 Last green measurement: `cargo test --locked` **1554 passed / 0 failed**,
 `scripts/e2e.sh` **180 passed / 0 failed**, warnings 79 bin / 55 test.
 
