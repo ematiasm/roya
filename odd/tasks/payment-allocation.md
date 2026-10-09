@@ -263,7 +263,7 @@ Out of scope (follow-ups, recorded so nobody invents them later):
 > anything is built on top of it. So the payment schema moves to **46**, and both
 > plans stay monotonic. Everything else in this document is unchanged.
 
-- [ ] **P1 — Migration 46 + repository + guards.** `payments`,
+- [x] **P1 — Migration 46 + repository + guards.** `payments`,
   `payment_allocations`, indexes, the method→account guard inherited from
   migration 44, and the split cap (`Σ allocations ≤ payment amount`). Trait +
   `Sqlite…` impl with `_in` twins and a checked residual fold. This layer starts
@@ -278,6 +278,24 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   insert sees its siblings, the parent's amount cannot be lowered under its
   allocations, and the residual fold refuses with `AggregateTooLarge` rather than
   panicking.
+  **CLOSED 2026-10-08 — committed as `4d7917c`** (migration 46, `Payment`/
+  `NewPayment`/`PaymentAllocation`/`PaymentDirection`/`format_payment_number`,
+  `PaymentRepository` + `SqlitePaymentRepository` with `_in` twins). Ten tests in
+  the module; RED by mutation (dropping the existing shares fails the two cap
+  tests, `>` to `>=` fails the exact-boundary one). **The layer is UNWIRED on
+  purpose, so the warning count went UP: 78 bin / 49 test → 97 bin / 53 test**,
+  14 of the new ones this repository's own dead code. That is the shape AGENTS.md
+  predicts; the count coming back down in P3/P4 is what proves the wiring is real.
+  One thing the tests caught in the writing, recorded because it is the kind of
+  mistake that looks like a passing suite: the first draft of `insert_payment` had
+  eleven columns and ten binds (it omitted `number`), so every value shifted one
+  position and the ACCOUNT received the amount. `NewPayment` now carries `number`
+  explicitly, taken by the caller from `doc_sequences` so a rollback returns it
+  instead of burning it.
+  Not done in P1, and named so it is not read as forgotten: `updated_at` has no
+  trigger. The only idiom migration 36 has for one is the `SELECT NEW.x = …`
+  comparison that writes nothing (see T6 of the payment-method document), so these
+  tables use the plain `updated_at = strftime(…)` the other repositories write.
 - [ ] **P2 — CANCELLED (2026-10-03).** The 1:1 backfill of legacy payments is not
   needed: the user confirmed the development database will be wiped and holds no
   production history. Its replacement is P8.
