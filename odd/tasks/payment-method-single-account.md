@@ -97,7 +97,7 @@ worktree, commitear por separado.
   Rust-side duplicate, that every other hunk in the 15-file diff falls inside a
   test module, and — the finding that mattered — that `INSERT OR REPLACE` cannot
   bypass the guard.
-- [ ] **T6 — Seed the default pair, so a fresh install can collect** (added
+- [x] **T6 — Seed the default pair, so a fresh install can collect** (added
   2026-10-03 by the user: sembrar una cuenta "cash" y un método de pago "cash"
   linkeado a la cuenta, "lo mínimo, básico y calculo que obligatorio en cualquier
   negocio"). Today **no migration seeds an account** and `/setup` does not touch
@@ -187,9 +187,8 @@ worktree, commitear por separado.
 the 79 bin / 49 test baseline (delta 0), `cargo fmt --check` clean, visual
 baseline regenerated after proving the diff is only the intended one.** T6 is the
 first slice of the payment chain; P1 of `odd/tasks/payment-allocation.md` is next.
-**NOT committed**: the working tree carries the change and the work-unit commit
-is the user's call, exactly as this document's own "fuera de alcance" says for
-commits. Last commit on the branch is still `7bba800` (T5).
+**Committed as `f9b769a`** on `feat/party-ledger`, after the user authorized the
+work-unit commit: 39 files, 2289 insertions, 704 deletions, one purpose.
 
 Resumed from a writer that ran out of tokens. Its tree was kept: migration 45, the
 repo service changes, its five T6 tests and the `db_err_message` helper. What was
@@ -292,6 +291,12 @@ added on resume, and why:
   payment-allocation schema (P1 of `odd/tasks/payment-allocation.md`), because a
   fresh install must be able to collect money before anything else is built on top
   of it.
+  **CLOSED 2026-10-08 — committed as `f9b769a`.** Observed: `cargo test --locked`
+  1518 passed / 0 failed; `scripts/e2e.sh` 180 passed / 0 failed; warnings at the
+  79 bin / 49 test baseline (delta 0); `cargo fmt --check` and `git diff --check`
+  clean; baseline visual regenerada con prueba; instalación fresca mirada en
+  navegador. Ver la sección "T6 implementation log" para las tres trampas que el
+  trabajo destapó.
 
 ## Verification evidence
 - Writer: `cargo check --all-targets` 0 errores; `cargo test` full 320 passed
