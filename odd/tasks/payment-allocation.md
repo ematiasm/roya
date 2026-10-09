@@ -102,6 +102,55 @@ loop.
    number that is the saldo a favor (flow 2). It is also what retires pure FIFO:
    the operator chooses the split and the database guarantees he cannot
    over-allocate.
+
+   **REFINED 2026-10-08, with the two limits MEASURED before writing P1.** The
+   claim above is true and was tested on a real SQLite 3.53.4, but a trigger on
+   one table cannot be the whole of an invariant that spans two, and the split
+   needed to be said out loud before the migration was written:
+
+   **What was measured as working.** A `BEFORE INSERT` trigger DOES see the rows
+   the same transaction already inserted — 60 + 30 against a payment of 100
+   passes, and a third allocation of 20 aborts. That is load-bearing: without it
+   this whole shape collapses, because a unit that writes its allocations one at a
+   time would only ever see its own row. The `BEFORE UPDATE` twin works too, with
+   the one clause that is easy to forget: `AND id <> NEW.id`, or an allocation
+   "corrected" to its own current value refuses itself.
+
+   **Limit 1 — lowering the payment's amount slips past the cap SILENTLY.**
+   Measured: 70 allocated against a payment of 100, then
+   `UPDATE payments SET amount = '10'`, and the result is 70 allocated against a
+   payment of 10 with NO error anywhere. The cap looks only at the allocation side;
+   the trigger cannot see the parent's `UPDATE`, which lives on another table.
+   Since `unapplied = delivered − allocated ≥ 0` is the number the business reads
+   as the credit balance, a negative residual here is not cosmetic. **Resolution
+   (2026-10-08): a payment's `amount` is IMMUTABLE once it has allocations.**
+   Changing what was delivered is a re-issue, not an edit, so the hole closes by
+   construction rather than by a check somebody must remember. This is a decision
+   about the document, not about the guard.
+
+   **Limit 2 — the trigger needs `CAST(… AS REAL)`, and this project forbids
+   `REAL` for money.** SQLite cannot sum `TEXT` decimals, so the guard's arithmetic
+   is not the arithmetic of the read: measured, `0.10 − 0.09` in `REAL` is
+   `0.010000000000000009`. With round cents the verdict agrees; at an exact
+   boundary it is a different sum than the one the code folds, which is where a
+   false allow or a false refusal lives. **Resolution (2026-10-08): the cap has
+   TWO homes with different roles.**
+   * The **service** validation is the real gate: it reads the payment's
+     allocations with `_in` inside the caller's unit, folds them in `Decimal` with
+     the existing `checked_money_sum`, and refuses with `AppError::Validation` —
+     a 400 naming the fix, and it sees the WHOLE pair (payment + allocations)
+     because it is not confined to one table. This is where the operator's
+     refusal comes from.
+   * The **schema** trigger stays as the backstop against direct SQL, in the same
+     spirit as migration 44: **INSERT-only**, and accepting that its arithmetic is
+     approximate and that it does not see the parent's update. It is a net under a
+     hand-written statement, not the rule.
+
+   This refines rather than replaces the original decision: the schema still
+   guarantees "you cannot allocate more than was delivered", and the service
+   guarantees the stronger claim the trigger could not express. The precedent is
+   migration 44, where the same reasoning produced an INSERT-only guard plus a
+   named residual hole instead of a cleverer trigger.
 5. **Decided (adopted, 2026-10-03) — one delivery, one cash movement.**
    `payments.transaction_id` holds the single `transactions` row, written once,
    with `reference` = the payment number. Allocations carry **no** account, no
@@ -220,6 +269,15 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   `Sqlite…` impl with `_in` twins and a checked residual fold. This layer starts
   unwired on purpose: the warning count goes **up** until P3/P4 call it, exactly
   the shape AGENTS.md predicts.
+  Carries the two refinements decision 4 gained on 2026-10-08: the cap lives in
+  the SERVICE as the real gate (Decimal, sees the whole pair, 400) **and** in the
+  schema as an INSERT-only backstop against direct SQL; and a payment's `amount`
+  is IMMUTABLE once it has allocations, which closes the silent hole where
+  lowering the delivered figure left the allocations above it. Tests for P1
+  therefore include the three the measurement produced: the same-transaction
+  insert sees its siblings, the parent's amount cannot be lowered under its
+  allocations, and the residual fold refuses with `AggregateTooLarge` rather than
+  panicking.
 - [ ] **P2 — CANCELLED (2026-10-03).** The 1:1 backfill of legacy payments is not
   needed: the user confirmed the development database will be wiped and holds no
   production history. Its replacement is P8.
