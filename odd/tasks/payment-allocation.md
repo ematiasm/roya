@@ -468,7 +468,14 @@ Out of scope (follow-ups, recorded so nobody invents them later):
   allocation cap, and P5 re-bases it on the same residual the reads use instead of keeping
   a second copy of a total. A per-document `Return` fold is also wanted here, not in P6:
   the link exists (`customer_returns.sale_id` / `purchase_returns.purchase_id`, NOT NULL),
-  so the residual is literal instead of a convention. Tests: a returned credit sale lowers
+  so the residual is literal instead of a convention. **The residual must round the
+  document total PER LINE through `services::line_taxes::tax_inclusive_total`, the way
+  `SalesService::tax_split` (`src/services/sales.rs:277`) does** — a repo that sums
+  `qty * price + tax` unrounded disagrees with the service for any line whose product is
+  not already at 2dp, and that disagreement is exactly what the identity above forbids.
+  `src/repositories/party_ledger_repo.rs:14` is the precedent for reusing that helper
+  from a repository, and the batch form derives it once so a single-document caller and a
+  set caller cannot disagree. Tests: a returned credit sale lowers
   balance, ageing and frees the credit limit; a payment applied to the oldest invoice ages
   on the oldest invoice and is not moved by a later credit; the supplier drawer reflects a
   confirmed return; and the identity `balance == Σ residuals + unapplied` holds on the
