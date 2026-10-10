@@ -77,10 +77,34 @@ pub trait PaymentRepository: Send + Sync {
 
     /// Refund deliveries recorded in the party journal for one document. An
     /// unknown document has no matching entries and therefore returns an empty list.
+    /// This is STRICT: it refuses if any Refund entry cannot be resolved, because a
+    /// decision must not proceed on an under-counted reversal.
     async fn list_refunds_for_document(
         &self,
         document_kind: PartyDocumentKind,
         document_id: i64,
+    ) -> AppResult<Vec<Payment>>;
+
+    /// Refund deliveries that can be resolved for a display, plus the number of
+    /// journal entries omitted because their reference did not resolve to a payment.
+    /// Renderers must use this instead of the strict decision read: they can show
+    /// the available rows without turning legacy history into a page failure, while
+    /// `unresolved_entries` makes partial data observable (callers should log/report
+    /// that count rather than silently presenting the rows as complete).
+    async fn list_refunds_for_document_tolerant(
+        &self,
+        document_kind: PartyDocumentKind,
+        document_id: i64,
+    ) -> AppResult<RefundDeliveries>;
+
+    /// Payments allocating to one document, oldest delivery first. The payment
+    /// amount in each result is the share allocated to this target, and includes
+    /// its account and method. The SQL order is deterministic by date then id so
+    /// refund planning consumes the same order as the former party-wide scan.
+    async fn list_allocating_to_target(
+        &self,
+        target_kind: PartyDocumentKind,
+        target_id: i64,
     ) -> AppResult<Vec<Payment>>;
 
     /// The number of refund deliveries for this document already reversed in the
@@ -161,6 +185,13 @@ pub trait PaymentRepository: Send + Sync {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Resolved journal deliveries for a display, with a count of omitted entries.
+#[derive(Debug, Clone)]
+pub struct RefundDeliveries {
+    pub payments: Vec<Payment>,
+    pub unresolved_entries: i64,
+}
 
 /// The auditable components of one Sale or Purchase's remaining balance.
 /// `signed_returns` is already signed as stored in the party journal.
@@ -641,6 +672,8 @@ impl PaymentRepository for SqlitePaymentRepository {
             .bind(party_id)
             .fetch_all(&self.pool)
             .await?;
+        #[cfg(test)]
+        self.count_batch_query();
         rows.into_iter().map(row_to_payment).collect()
     }
 
@@ -746,6 +779,85 @@ impl PaymentRepository for SqlitePaymentRepository {
         rows.into_iter().map(row_to_payment).collect()
     }
 
+    async fn list_refunds_for_document_tolerant(
+        &self,
+        document_kind: PartyDocumentKind,
+        document_id: i64,
+    ) -> AppResult<RefundDeliveries> {
+        let qualified_columns = PAYMENT_COLUMNS
+            .split(", ")
+            .map(|column| format!("p.{column}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {qualified_columns} FROM party_ledger_entries e \
+             JOIN payments p ON p.number = e.reference \
+             WHERE e.kind = 'Refund' AND e.document_kind = ? AND e.document_id = ? \
+             ORDER BY e.id"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(document_kind.to_string())
+            .bind(document_id)
+            .fetch_all(&self.pool)
+            .await?;
+        let entry_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM party_ledger_entries \
+             WHERE kind = 'Refund' AND document_kind = ? AND document_id = ?",
+        )
+        .bind(document_kind.to_string())
+        .bind(document_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let resolved_count = i64::try_from(rows.len())
+            .map_err(|_| AppError::Internal("refund result count exceeded i64".into()))?;
+        let unresolved_entries = entry_count.checked_sub(resolved_count).ok_or_else(|| {
+            AppError::Internal(format!(
+                "resolved Refund rows exceed journal entry count for {document_kind} {document_id}"
+            ))
+        })?;
+        Ok(RefundDeliveries {
+            payments: rows
+                .into_iter()
+                .map(row_to_payment)
+                .collect::<AppResult<_>>()?,
+            unresolved_entries,
+        })
+    }
+
+    async fn list_allocating_to_target(
+        &self,
+        target_kind: PartyDocumentKind,
+        target_id: i64,
+    ) -> AppResult<Vec<Payment>> {
+        let qualified_columns = PAYMENT_COLUMNS
+            .split(", ")
+            .map(|column| format!("p.{column}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {qualified_columns}, a.amount AS target_amount \
+             FROM payment_allocations a \
+             JOIN payments p ON p.id = a.payment_id \
+             WHERE a.target_kind = ? AND a.target_id = ? \
+             ORDER BY p.date, p.id, a.id"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(target_kind.to_string())
+            .bind(target_id)
+            .fetch_all(&self.pool)
+            .await?;
+        #[cfg(test)]
+        self.count_batch_query();
+        let mut payments = Vec::with_capacity(rows.len());
+        for row in rows {
+            let amount = parse_decimal(&row.try_get::<String, _>("target_amount")?);
+            let mut payment = row_to_payment(row)?;
+            payment.amount = amount;
+            payments.push(payment);
+        }
+        Ok(payments)
+    }
+
     async fn count_reversals_for_document(
         &self,
         document_kind: PartyDocumentKind,
@@ -762,7 +874,10 @@ impl PaymentRepository for SqlitePaymentRepository {
     }
 
     async fn list_allocations(&self, payment_id: i64) -> AppResult<Vec<PaymentAllocation>> {
-        list_allocations_raw(&self.pool, payment_id).await
+        let allocations = list_allocations_raw(&self.pool, payment_id).await?;
+        #[cfg(test)]
+        self.count_batch_query();
+        Ok(allocations)
     }
 
     async fn unapplied_for_payment(&self, payment_id: i64) -> AppResult<Decimal> {
@@ -1690,6 +1805,84 @@ mod tests {
             .unwrap()
             .is_empty());
         assert_eq!(repo.batch_query_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn batched_target_allocations_match_the_per_payment_read_in_oldest_first_order() {
+        let pool = test_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let (sale, _) = seed_confirmed_sale(&pool, actor, "100").await;
+        let customer: i64 = sqlx::query_scalar("SELECT customer_id FROM sales WHERE id = ?")
+            .bind(sale)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let first = seed_payment(&pool, "30").await;
+        let second = seed_payment(&pool, "40").await;
+        sqlx::query("UPDATE payments SET party_id = ? WHERE id IN (?, ?)")
+            .bind(customer)
+            .bind(first)
+            .bind(second)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let repo = SqlitePaymentRepository::new(pool);
+        repo.allocate(&allocation(first, sale, "30")).await.unwrap();
+        repo.allocate(&allocation(second, sale, "40"))
+            .await
+            .unwrap();
+
+        // The old implementation loaded every party payment and queried each
+        // one's allocations, then retained this target's positive share.
+        repo.reset_batch_query_count();
+        let mut per_payment = Vec::new();
+        for mut payment in repo
+            .list_for_party(PartyType::Customer, customer)
+            .await
+            .unwrap()
+        {
+            if payment.direction != PaymentDirection::In {
+                continue;
+            }
+            let allocations = repo.list_allocations(payment.id).await.unwrap();
+            let amount = checked_money_sum(
+                allocations
+                    .iter()
+                    .filter(|share| {
+                        share.target_kind == PartyDocumentKind::Sale && share.target_id == sale
+                    })
+                    .map(|share| &share.amount),
+            )
+            .unwrap();
+            if amount > Decimal::ZERO {
+                payment.amount = amount;
+                per_payment.push(payment);
+            }
+        }
+        per_payment.sort_by_key(|payment| (payment.date, payment.id));
+        assert_eq!(
+            repo.batch_query_count(),
+            3,
+            "party list plus one allocation read per payment"
+        );
+
+        repo.reset_batch_query_count();
+        let batched = repo
+            .list_allocating_to_target(PartyDocumentKind::Sale, sale)
+            .await
+            .unwrap();
+        assert_eq!(repo.batch_query_count(), 1);
+        assert_eq!(
+            batched
+                .iter()
+                .map(|payment| (payment.id, payment.amount))
+                .collect::<Vec<_>>(),
+            per_payment
+                .iter()
+                .map(|payment| (payment.id, payment.amount))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(batched.len(), 2);
     }
 
     #[tokio::test]

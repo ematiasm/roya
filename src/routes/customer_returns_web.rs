@@ -63,7 +63,7 @@ use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
 use crate::models::{CustomerReturn, CustomerReturnStatus};
 use crate::repositories::customer_return_repo::CustomerReturnListFilter;
-use crate::repositories::CustomerReturnRepository;
+use crate::repositories::{CustomerReturnRepository, PaymentRepository};
 use crate::routes::{localized_refusal_error, AppState};
 use crate::security::authz::{Nav, Require, SalesCancel, SalesCreate, SalesRead};
 
@@ -629,7 +629,22 @@ async fn record_context(
     // call covers the payment table; a payment whose method or account is no longer
     // in that catalogue degrades to its id rather than failing the page.
     let methods = state.payment_method_service.methods_with_accounts().await?;
-    let refunds = detail
+    let deliveries = state
+        .customer_return_service
+        .payments
+        .list_refunds_for_document_tolerant(
+            crate::models::PartyDocumentKind::CustomerReturn,
+            detail.customer_return.id,
+        )
+        .await?;
+    if deliveries.unresolved_entries > 0 {
+        tracing::warn!(
+            document_id = detail.customer_return.id,
+            unresolved_entries = deliveries.unresolved_entries,
+            "some refund journal entries could not be resolved for the customer return page"
+        );
+    }
+    let refunds = deliveries
         .payments
         .iter()
         .map(|payment| {

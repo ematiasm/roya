@@ -43,8 +43,8 @@ use rust_decimal::Decimal;
 use crate::error::{AppError, AppResult};
 use crate::models::{
     format_customer_return_number, CustomerReturn, CustomerReturnDetail, CustomerReturnLine,
-    CustomerReturnPayment, CustomerReturnStatus, MovementReason, MovementType, NewMovement,
-    PriceRefusal, Sale, SaleDetail, SaleLine,
+    CustomerReturnStatus, MovementReason, MovementType, NewMovement, PriceRefusal, Sale,
+    SaleDetail, SaleLine,
 };
 use crate::services::checked_money_sum;
 
@@ -153,7 +153,7 @@ where
     /// is a bounded multiplication and the sum of a set of them is not.
     fn document_money(
         lines: &[CustomerReturnLine],
-        payments: &[CustomerReturnPayment],
+        payments: &[crate::models::Payment],
     ) -> Result<crate::models::RecordMoney, PriceRefusal> {
         let subtotals: Vec<Decimal> = lines.iter().map(|l| l.subtotal()).collect();
         let net_subtotal = checked_money_sum(subtotals.iter())?;
@@ -177,8 +177,32 @@ where
 
     async fn detail_for(&self, customer_return: CustomerReturn) -> AppResult<CustomerReturnDetail> {
         let lines = self.returns.list_lines(customer_return.id).await?;
+        // Preserve the legacy model field until its type can move, but money is
+        // derived only from journal-backed refund deliveries.
+        //
+        // MEASURED: as of P5.3b-4 NO production consumer reads `detail.payments`
+        // any more — both routes build their refund rows from the journal, and no
+        // template mentions the field. Only tests still read it. So this legacy
+        // `list_payments` is now dead weight kept for the tests' sake, and it is
+        // the last thing tying `customer_return_payments` to a read: dropping the
+        // field (or re-expressing those tests against the journal) removes it.
         let payments = self.returns.list_payments(customer_return.id).await?;
-        let money = Self::document_money(&lines, &payments).map_err(AppError::PriceRefused)?;
+        let deliveries = self
+            .payments
+            .list_refunds_for_document_tolerant(
+                crate::models::PartyDocumentKind::CustomerReturn,
+                customer_return.id,
+            )
+            .await?;
+        if deliveries.unresolved_entries > 0 {
+            tracing::warn!(
+                document_id = customer_return.id,
+                unresolved_entries = deliveries.unresolved_entries,
+                "some refund journal entries could not be resolved for the customer return display"
+            );
+        }
+        let money =
+            Self::document_money(&lines, &deliveries.payments).map_err(AppError::PriceRefused)?;
         Ok(CustomerReturnDetail {
             customer_return,
             lines,
@@ -538,8 +562,11 @@ where
         // The document's money is resolved BEFORE any write below, exactly as on
         // the sale side: a confirmation that cannot state what the credit note
         // costs must refuse with nothing written.
-        let money = Self::document_money(&lines, &self.returns.list_payments(return_id).await?)
-            .map_err(AppError::PriceRefused)?;
+        let deliveries = self
+            .payments
+            .list_refunds_for_document(crate::models::PartyDocumentKind::CustomerReturn, return_id)
+            .await?;
+        let money = Self::document_money(&lines, &deliveries).map_err(AppError::PriceRefused)?;
         let total = money.total;
 
         // ---- THE REFUND CAP -------------------------------------------------
@@ -567,9 +594,21 @@ where
         // legitimate case the cap cannot hold, and it is v1's answer rather than
         // a solution. Do not invent a credit-balance mechanism here to make that
         // case fit; it needs a decision.
-        let parent_payments = self.sales.list_payments(sale.id).await?;
-        let collected = checked_money_sum(parent_payments.iter().map(|p| &p.amount))
+        let parts = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &[sale.id])
+            .await?
+            .remove(&sale.id)
+            .ok_or_else(|| AppError::Internal(format!("sale {} residual missing", sale.id)))?;
+        // This identity avoids counting a prior return as a collection:
+        // charge + signed returns - residual = applied allocations. Both
+        // subtractions/folds stay in checked Decimal arithmetic.
+        let after_returns = checked_money_sum([parts.charge, parts.signed_returns].iter())
             .map_err(AppError::PriceRefused)?;
+        let collected = after_returns
+            .checked_sub(parts.residual)
+            .ok_or(AppError::PriceRefused(PriceRefusal::DocumentTotalTooLarge))?;
+        let parent_payments = self.parent_allocations(sale.id, sale.customer_id).await?;
         if collected > Decimal::ZERO && total > collected {
             return Err(AppError::Validation(format!(
                 "credit note is worth {total} but sale {} has only collected {collected} from \
@@ -742,9 +781,27 @@ where
     /// cannot underflow by construction — `take` is `min(remaining, ...)` — and
     /// the checked form makes that a property of the code rather than a fact
     /// about the caller.
+    async fn parent_allocations(
+        &self,
+        sale_id: i64,
+        customer_id: i64,
+    ) -> AppResult<Vec<crate::models::Payment>> {
+        let payments = self
+            .payments
+            .list_allocating_to_target(crate::models::PartyDocumentKind::Sale, sale_id)
+            .await?;
+        Ok(payments
+            .into_iter()
+            .filter(|payment| payment.direction == crate::models::PaymentDirection::In)
+            .filter(|payment| payment.party_type == crate::models::PartyType::Customer)
+            .filter(|payment| payment.amount > Decimal::ZERO)
+            .filter(|payment| payment.party_id == customer_id)
+            .collect())
+    }
+
     fn refund_plan(
         total: Decimal,
-        parent_payments: &[crate::models::SalePayment],
+        parent_payments: &[crate::models::Payment],
     ) -> AppResult<Vec<RefundPlan>> {
         let mut remaining = total;
         let mut plan = Vec::new();
@@ -815,7 +872,11 @@ where
         // would move stock and money and only the read at the end would refuse.
         let lines = self.returns.list_lines(return_id).await?;
         let payments = self.returns.list_payments(return_id).await?;
-        Self::document_money(&lines, &payments).map_err(AppError::PriceRefused)?;
+        let deliveries = self
+            .payments
+            .list_refunds_for_document(crate::models::PartyDocumentKind::CustomerReturn, return_id)
+            .await?;
+        Self::document_money(&lines, &deliveries).map_err(AppError::PriceRefused)?;
 
         if customer_return.status == CustomerReturnStatus::Draft {
             // Draft -> Cancelled: discard, no stock or finance side effect.
@@ -857,7 +918,6 @@ where
                 payments.len()
             )));
         }
-
         let mut tracked: Vec<(CustomerReturnLine, SaleLine)> = Vec::new();
         for line in &lines {
             let parent = self.parent_line(line.sale_line_id).await?;
@@ -918,8 +978,8 @@ where
         // refused for want of funds — which is what makes a credit note genuinely
         // reversible, where a purchase return's reversal can be refused because the shop
         // has already spent the refund it received.
-        // Lengths were checked before entering the write unit; zip is now a
-        // one-to-one pairing with the legacy rows needed by the detail reader.
+        // The legacy row remains the destination for its reversal link until the
+        // later write-side removal; the returned detail keeps that legacy model shape.
         for (pay, legacy_payment) in deliveries.iter().zip(&payments) {
             let reversal_delivery = crate::services::payment_writer::record_delivery_in(
                 &self.sequences,
@@ -1010,14 +1070,13 @@ mod tests {
     use crate::models::{NewProduct, PaymentStatus, ProductKind};
     use crate::repositories::{
         customer_return_repo::CustomerReturnListFilter, CustomerReturnRepository,
-        PaymentRepository,
-        SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
-        SqliteCustomerReturnRepository, SqliteDocSequenceRepository, SqliteProductRepository,
-        SqliteSaleRepository, SqliteStockMovementRepository, SqliteTransactionRepository,
+        PaymentRepository, SqliteAccountRepository, SqliteBarcodeRepository,
+        SqliteCategoryRepository, SqliteCustomerReturnRepository, SqliteDocSequenceRepository,
+        SqliteProductRepository, SqliteSaleRepository, SqliteStockMovementRepository,
+        SqliteTransactionRepository,
     };
     use crate::repositories::{
-        PartyLedgerRepository, SqlitePartyLedgerRepository,
-        SqlitePaymentRepository,
+        PartyLedgerRepository, SqlitePartyLedgerRepository, SqlitePaymentRepository,
     };
     use crate::security::test_support;
     use crate::services::{InventoryService, TransactionService};
@@ -1248,7 +1307,27 @@ mod tests {
     /// reads their accounts.
     async fn collect(pool: &SqlitePool, sale_id: i64, number: &str, amounts: &[(&str, &str)]) {
         let who = actor(pool).await;
-        for (account_name, amount) in amounts {
+        let customer_id: i64 = sqlx::query_scalar("SELECT customer_id FROM sales WHERE id = ?")
+            .bind(sale_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let lines: Vec<(String, String)> =
+            sqlx::query_as("SELECT qty, unit_price FROM sale_lines WHERE sale_id = ? ORDER BY id")
+                .bind(sale_id)
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        let mut charge = Decimal::ZERO;
+        for (qty, unit_price) in lines {
+            let line_total = Decimal::from_str(&qty)
+                .unwrap()
+                .checked_mul(Decimal::from_str(&unit_price).unwrap())
+                .unwrap();
+            charge = charge.checked_add(line_total).unwrap();
+        }
+        let mut allocated = Decimal::ZERO;
+        for (index, (account_name, amount)) in amounts.iter().enumerate() {
             let account = seed_account(pool, account_name).await;
             let method = owned_method(pool, account).await;
             let tx: i64 = sqlx::query_scalar(
@@ -1277,6 +1356,35 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+            let payment_id: i64 = sqlx::query_scalar(
+                "INSERT INTO payments (number, direction, party_type, party_id, method_id, account_id, amount, date, transaction_id, created_by) VALUES (?, 'In', 'Customer', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            )
+            .bind(format!("TEST-COLLECT-{sale_id}-{index}"))
+            .bind(customer_id)
+            .bind(method)
+            .bind(account)
+            .bind(dec(amount).to_string())
+            .bind(sale_date())
+            .bind(tx)
+            .bind(who)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let remaining = charge.checked_sub(allocated).unwrap();
+            let share = dec(amount).min(remaining);
+            if share > Decimal::ZERO {
+                sqlx::query(
+                    "INSERT INTO payment_allocations (payment_id, target_kind, target_id, amount, created_by) VALUES (?, 'Sale', ?, ?, ?)",
+                )
+                .bind(payment_id)
+                .bind(sale_id)
+                .bind(share.to_string())
+                .bind(who)
+                .execute(pool)
+                .await
+                .unwrap();
+                allocated = allocated.checked_add(share).unwrap();
+            }
         }
     }
 
@@ -1495,21 +1603,19 @@ mod tests {
             vec!["Income", "Expense"],
             "the parent's own collection was an Income; the refund is an Expense"
         );
-        let delivery_number: String = sqlx::query_scalar(
-            "SELECT number FROM payments WHERE transaction_id = ?",
-        )
-        .bind(detail.payments[0].transaction_id.unwrap())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let delivery_number: String =
+            sqlx::query_scalar("SELECT number FROM payments WHERE transaction_id = ?")
+                .bind(detail.payments[0].transaction_id.unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(
             tx_references(&pool).await,
             vec!["2024-SALE-MIRROR".to_string(), delivery_number.clone()],
             "the reference names the delivery (decision 5); the credit note number is the movement description and Refund locator"
         );
         assert_ne!(
-            delivery_number,
-            "2024-SALE-MIRROR",
+            delivery_number, "2024-SALE-MIRROR",
             "the refund movement is not stamped with the parent's number"
         );
         assert_eq!(payment_count(&pool).await, 1);
@@ -2951,13 +3057,12 @@ mod tests {
             "3",
         )
         .await;
-        let (sale_id, customer_id): (i64, i64) = sqlx::query_as(
-            "SELECT sale_id, customer_id FROM customer_returns WHERE id = ?",
-        )
-        .bind(p.return_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        let (sale_id, customer_id): (i64, i64) =
+            sqlx::query_as("SELECT sale_id, customer_id FROM customer_returns WHERE id = ?")
+                .bind(p.return_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         let ledger = SqlitePartyLedgerRepository::new(pool.clone());
         let who = actor(&pool).await;
         for (kind, amount) in [
@@ -3348,12 +3453,84 @@ mod tests {
         match err {
             AppError::Internal(message) => {
                 assert!(message.contains("2 Refund journal entries"), "{message}");
-                assert!(message.contains("1 payment deliveries resolved"), "{message}");
-                assert!(message.contains("reference may not be a payment number"), "{message}");
+                assert!(
+                    message.contains("1 payment deliveries resolved"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("reference may not be a payment number"),
+                    "{message}"
+                );
                 assert!(message.contains("T1 backfill"), "{message}");
             }
             other => panic!("expected internal inconsistency, got {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn tolerant_refund_display_returns_resolved_rows_and_reports_backfill_entries_while_strict_read_refuses(
+    ) {
+        let (s, pool) = svc().await;
+        let p = draft_credit_note(
+            &s,
+            &pool,
+            "BACKFILL-TOLERANT",
+            "Tolerant Backfill Customer",
+            "3",
+            "4",
+            &[("tolerant backfill till", "12")],
+            "2",
+        )
+        .await;
+        let who = actor(&pool).await;
+        s.confirm(who, p.return_id).await.unwrap();
+        let (customer_id, document_number): (i64, String) = sqlx::query_as(
+            "SELECT customer_id, credit_note_number FROM customer_returns WHERE id = ?",
+        )
+        .bind(p.return_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO party_ledger_entries \
+             (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by) \
+             VALUES ('Customer', ?, 'Refund', '-1', 'CustomerReturn', ?, '2024-06-01', ?, ?)",
+        )
+        .bind(customer_id)
+        .bind(p.return_id)
+        .bind(document_number)
+        .bind(who)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tolerant = s
+            .payments
+            .list_refunds_for_document_tolerant(
+                crate::models::PartyDocumentKind::CustomerReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tolerant.payments.len(),
+            1,
+            "the resolvable delivery remains visible"
+        );
+        assert_eq!(
+            tolerant.unresolved_entries, 1,
+            "the backfill-shaped entry is reported"
+        );
+        assert!(
+            s.payments
+                .list_refunds_for_document(
+                    crate::models::PartyDocumentKind::CustomerReturn,
+                    p.return_id,
+                )
+                .await
+                .is_err(),
+            "the strict decision read continues to refuse partial history"
+        );
     }
 
     #[tokio::test]
@@ -3377,9 +3554,9 @@ mod tests {
         let customer_id: i64 =
             sqlx::query_scalar("SELECT customer_id FROM customer_returns WHERE id = ?")
                 .bind(p.return_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         sqlx::query(
             "INSERT INTO party_ledger_entries \
              (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by) \
