@@ -675,7 +675,7 @@ where
         //    allocations, and names the credit note in its movement description;
         //    its transaction reference is the delivery number by decision 5.
         for refund in &plan {
-            let delivery = crate::services::payment_writer::record_delivery_in(
+            crate::services::payment_writer::record_delivery_in(
                 &self.sequences,
                 &self.transactions,
                 &self.party_ledger,
@@ -696,20 +696,6 @@ where
                 &[],
             )
             .await?;
-            // Keep the legacy row until its cancel-path reads move. It shares
-            // this unit and points at the same movement as the new delivery.
-            self.returns
-                .create_payment_in(
-                    &mut tx,
-                    actor,
-                    return_id,
-                    refund.account_id,
-                    refund.method_id,
-                    refund.amount,
-                    customer_return.return_date,
-                    delivery.transaction_id,
-                )
-                .await?;
         }
 
         // 5. The customer's journal, in the SAME unit as the goods movement (T2
@@ -860,7 +846,6 @@ where
         // the reason `PurchasesService::cancel` states: without it a reversal
         // would move stock and money and only the read at the end would refuse.
         let lines = self.returns.list_lines(return_id).await?;
-        let payments = self.returns.list_payments(return_id).await?;
         let deliveries = self
             .payments
             .list_refunds_for_document(crate::models::PartyDocumentKind::CustomerReturn, return_id)
@@ -898,13 +883,6 @@ where
                 "reversal already partially applied: {reversals} of {} refunds already link a reversal; \
                  refusing to take the goods back a second time or duplicate the reversal",
                 deliveries.len()
-            )));
-        }
-        if deliveries.len() != payments.len() {
-            return Err(AppError::Internal(format!(
-                "internal inconsistency reversing customer return {return_id}: {} journal refund deliveries but {} legacy payment rows",
-                deliveries.len(),
-                payments.len()
             )));
         }
         let mut tracked: Vec<(CustomerReturnLine, SaleLine)> = Vec::new();
@@ -967,12 +945,9 @@ where
         // refused for want of funds — which is what makes a credit note genuinely
         // reversible, where a purchase return's reversal can be refused because the shop
         // has already spent the refund it received.
-        // The legacy row stays the destination for its reversal link until the
-        // write side goes too; that is the only reason the legacy read above is
-        // still here. Nothing else reads `detail.payments` since P5.3b-5 removed
-        // the field: the legacy read exists to pair a delivery with its legacy row
-        // so the reversal link can be written to it.
-        for (pay, legacy_payment) in deliveries.iter().zip(&payments) {
+        // The journal's refund deliveries are the authority for what was refunded
+        // and through which account, so each reversal replays one of them directly.
+        for pay in &deliveries {
             let reversal_delivery = crate::services::payment_writer::record_delivery_in(
                 &self.sequences,
                 &self.transactions,
@@ -995,14 +970,15 @@ where
                 &[],
             )
             .await?;
-            let reversal_id = reversal_delivery
-                .transaction_id
-                .ok_or_else(|| AppError::Internal("reversal delivery has no movement".into()))?;
-            // Keep the legacy row faithful for existing detail readers until b-4
-            // drops that table; the cancel guard now reads the journal instead.
-            self.returns
-                .set_payment_refund_transaction_in(&mut tx, actor, legacy_payment.id, reversal_id)
-                .await?;
+            // The reversal must have produced its movement, or the unit is broken.
+            // This used to also stamp the legacy row's reversal link; that column is
+            // the journal's now and nothing reads it (P5.3b-3 moved the guard,
+            // P5.3b-5 the detail), so the check stands and the write is gone.
+            if reversal_delivery.transaction_id.is_none() {
+                return Err(AppError::Internal(
+                    "reversal delivery has no movement".into(),
+                ));
+            }
         }
 
         let cancelled = self
@@ -1453,12 +1429,16 @@ mod tests {
             .unwrap()
     }
 
+    /// How many refund rows this family has written, read from the journal that
+    /// owns the fact since P5.3b-2: one `Refund` entry per refund delivery.
     async fn payment_count(pool: &SqlitePool) -> i64 {
-        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM customer_return_payments")
-            .fetch_one(pool)
-            .await
-            .unwrap()
-            .0
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM party_ledger_entries WHERE kind = 'Refund' AND document_kind = 'CustomerReturn'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .0
     }
 
     async fn sret_sequence_last(pool: &SqlitePool) -> Option<i64> {
@@ -1687,12 +1667,17 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        let (refund_account,): (i64,) =
-            sqlx::query_as("SELECT account_id FROM customer_return_payments WHERE return_id = ?")
-                .bind(p.return_id)
-                .fetch_one(&pool)
-                .await
-                .unwrap();
+        // The account comes from the journal's refund delivery, which is where the
+        // replayed pair lives since the legacy rows stopped being written.
+        let (refund_account,): (i64,) = sqlx::query_as(
+            "SELECT p.account_id FROM party_ledger_entries e \
+             JOIN payments p ON p.number = e.reference \
+             WHERE e.kind = 'Refund' AND e.document_kind = 'CustomerReturn' AND e.document_id = ?",
+        )
+        .bind(p.return_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             refund_account, till_account,
             "the money goes back out of the box it went into"
@@ -2395,11 +2380,19 @@ mod tests {
             "the split refund plan writes one return-located Refund for each delivery"
         );
 
-        let accounts: Vec<i64> =
-            sqlx::query_scalar("SELECT account_id FROM customer_return_payments ORDER BY id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        // The accounts come from the deliveries the journal resolves, which is where
+        // the split lives since the legacy rows stopped being written.
+        let accounts: Vec<i64> = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::CustomerReturn,
+                credit_note.id,
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| p.account_id)
+            .collect();
         assert_eq!(accounts.len(), 2);
         assert_ne!(
             accounts[0], accounts[1],
@@ -2408,8 +2401,7 @@ mod tests {
 
         let orphans: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM transactions t \
-             WHERE NOT EXISTS (SELECT 1 FROM customer_return_payments rp WHERE rp.transaction_id = t.id \
-                               OR rp.refund_transaction_id = t.id) \
+             WHERE NOT EXISTS (SELECT 1 FROM payments p WHERE p.transaction_id = t.id) \
                AND NOT EXISTS (SELECT 1 FROM sale_payments sp WHERE sp.transaction_id = t.id \
                                OR sp.refund_transaction_id = t.id)",
         )
@@ -3925,11 +3917,15 @@ mod tests {
         let who = actor(&pool).await;
         let return_id = p.return_id;
 
+        // The window is the same one it always was — after the refund Expense, on the
+        // row that records the refund — but that row is the delivery's `payments`
+        // row now, so the injection moves with it.
         inject(
             &pool,
             format!(
-                "CREATE TRIGGER cret_w3 BEFORE INSERT ON customer_return_payments \
-                 WHEN NEW.return_id = {return_id} \
+                "CREATE TRIGGER cret_w3 BEFORE INSERT ON payments \
+                 WHEN NEW.direction = 'Out' AND NEW.party_id = ( \
+                     SELECT customer_id FROM customer_returns WHERE id = {return_id}) \
                  BEGIN SELECT RAISE(ABORT, 'injected payment-row failure'); END"
             ),
         )
@@ -3960,8 +3956,7 @@ mod tests {
 
         let orphans: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM transactions t \
-             WHERE NOT EXISTS (SELECT 1 FROM customer_return_payments rp WHERE rp.transaction_id = t.id \
-                               OR rp.refund_transaction_id = t.id) \
+             WHERE NOT EXISTS (SELECT 1 FROM payments p WHERE p.transaction_id = t.id) \
                AND NOT EXISTS (SELECT 1 FROM sale_payments sp WHERE sp.transaction_id = t.id \
                                OR sp.refund_transaction_id = t.id)",
         )
@@ -4085,7 +4080,7 @@ mod tests {
 
         inject(
             &pool,
-            "CREATE TRIGGER cret_retry BEFORE INSERT ON customer_return_payments \
+            "CREATE TRIGGER cret_retry BEFORE INSERT ON payments \
              BEGIN SELECT RAISE(ABORT, 'injected retry failure'); END"
                 .to_string(),
         )
