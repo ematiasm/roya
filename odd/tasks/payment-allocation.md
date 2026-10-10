@@ -998,18 +998,31 @@ The residual hole is the one migration 44 already accepted and named for the leg
 tables. Migration 46 is never edited; migration 48 drops and recreates the trigger, the
 recreate pattern later migrations already use (`20240101000032:71-72`).
 
-**Then, the other half of this unit**: the `cancel` refuses a partially-applied reversal
-by counting the legacy rows that link one (`customer_return.rs:848-856`,
-`p.refund_transaction_id.is_some()`). `payments` has no `refund_transaction_id`, and
-migration 19 gave that column to the legacy tables with one shape: `INTEGER NULL
-REFERENCES transactions(id) ON DELETE RESTRICT`. The replacement is a column of the same
-name and shape on `payments`, added by migration 49, following the precedent migration 47
-set for `receipt_id`, plus its index.
+**Decision (user, 2026-10-09): the journal IS the source, and no migration is needed.**
+An earlier revision of this section said the link had to become a column because "nothing
+in the journal says WHICH refund delivery a reversal answers". **That was wrong**, and it
+is corrected here rather than deleted, because it is the reasoning a future reader would
+re-derive. Measured with a probe on a confirmed-then-cancelled credit note:
 
-Deriving that link from the journal was considered and rejected: the `Refund` entry the
-confirm writes and the `Payment` entry the cancel writes both carry the return's
-`(document_kind, document_id)`, but nothing there says WHICH refund delivery a reversal
-answers, and that is the count the guard needs.
+    after confirm: [("Refund", "2024-PAY-000001"), ("Return", "2024-SRET-000001")]
+    after cancel:  [("Refund", ...), ("Return", ...), ("Payment", "2024-PAY-000002")]
+    Payment entries for (CustomerReturn, <id>) = 1
+
+After P5.3b-1 the journal carries everything the guard needs, and the join is exact: a
+`Refund` entry's `reference` is the PAYMENT number (`payment_writer.rs:179`) and
+`payments.number` is unique. So **M** = the `Refund` entries for that document = the
+refund deliveries it made, and **N** = the `Payment` entries with the same locator = how
+many have been reversed. The guard only COUNTS — it never needs to know *which* delivery
+a reversal answers — which is exactly why the objection did not apply.
+
+No migration 49. The legacy `refund_transaction_id` stops being read here and goes with
+its table in b-4.
+
+Two facts worth keeping: the `cancel` has been ATOMIC since T3d (one unit for stock,
+reversals and the cancellation), so the "partial" state the guard refuses is
+unreachable by the normal path and the guard defends against a pre-T3d residue; and the
+return families had NO test of that guard, while `sales.rs:3413` and `purchases.rs:3907`
+pin it for the other two families by simulating the residual.
 
 ## Resume here
 
