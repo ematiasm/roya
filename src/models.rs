@@ -3679,9 +3679,9 @@ impl std::str::FromStr for PartyEntryKind {
 }
 
 /// The family of the document an entry points at. The pair (kind, id) is the
-/// reference — four families, one column set, so it cannot be a foreign key
-/// (migration 42's header says why that is a property of SQLite and not a
-/// shortcut).
+/// reference — document families plus receipts, one column set, so it cannot
+/// be a foreign key (migration 42's header says why that is a property of SQLite
+/// and not a shortcut).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[sqlx(type_name = "TEXT")]
 #[sqlx(rename_all = "PascalCase")]
@@ -3691,6 +3691,7 @@ pub enum PartyDocumentKind {
     Purchase,
     CustomerReturn,
     PurchaseReturn,
+    CustomerReceipt,
 }
 
 impl std::fmt::Display for PartyDocumentKind {
@@ -3700,6 +3701,7 @@ impl std::fmt::Display for PartyDocumentKind {
             Self::Purchase => write!(f, "Purchase"),
             Self::CustomerReturn => write!(f, "CustomerReturn"),
             Self::PurchaseReturn => write!(f, "PurchaseReturn"),
+            Self::CustomerReceipt => write!(f, "CustomerReceipt"),
         }
     }
 }
@@ -3712,6 +3714,7 @@ impl std::str::FromStr for PartyDocumentKind {
             "purchase" => Ok(Self::Purchase),
             "customerreturn" => Ok(Self::CustomerReturn),
             "purchasereturn" => Ok(Self::PurchaseReturn),
+            "customerreceipt" => Ok(Self::CustomerReceipt),
             _ => Err(format!("invalid party document kind: {s}")),
         }
     }

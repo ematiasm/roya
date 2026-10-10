@@ -69,6 +69,7 @@ pub async fn record_delivery_in<DR, A, T, PL, PY>(
     direction: crate::models::PaymentDirection,
     party_type: crate::models::PartyType,
     party_id: i64,
+    document: (crate::models::PartyDocumentKind, i64),
     method_id: i64,
     account_id: i64,
     amount: Decimal,
@@ -160,16 +161,12 @@ where
                 party_id,
                 kind: entry_kind,
                 amount: entry_kind.signed_amount(amount),
-                // The entry names the FIRST document the delivery covers; the
-                // full set lives in the allocations. A `Payment`/`Refund` entry is
-                // legitimately multiple per document (migration 43's partial
-                // index excludes those kinds for exactly that reason), so this is
-                // a locator, not an identity.
-                document_kind: allocations
-                    .first()
-                    .map(|(kind, _, _)| *kind)
-                    .unwrap_or(crate::models::PartyDocumentKind::Sale),
-                document_id: allocations.first().map(|(_, id, _)| *id).unwrap_or(0),
+                // The caller supplies the locator explicitly. A `Payment`/`Refund`
+                // entry may be multiple per document (migration 43's partial index
+                // excludes those kinds for exactly that reason), so this is a locator,
+                // not an identity.
+                document_kind: document.0,
+                document_id: document.1,
                 entry_date: date,
                 reference: Some(payment_number.clone()),
                 created_by: actor,

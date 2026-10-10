@@ -940,6 +940,7 @@ where
                 crate::models::PaymentDirection::Out,
                 crate::models::PartyType::Supplier,
                 purchase.supplier_id,
+                (crate::models::PartyDocumentKind::PurchaseReturn, return_id),
                 pay.method_id,
                 pay.account_id,
                 pay.amount,

@@ -222,6 +222,7 @@ where
             crate::models::PaymentDirection::In,
             crate::models::PartyType::Customer,
             customer_id,
+            (crate::models::PartyDocumentKind::CustomerReceipt, receipt.id),
             method_id,
             account_id,
             amount,

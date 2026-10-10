@@ -384,7 +384,9 @@ async fn residuals_for_documents_in(
             "purchase_id",
             "Purchase",
         ),
-        PartyDocumentKind::CustomerReturn | PartyDocumentKind::PurchaseReturn => {
+        PartyDocumentKind::CustomerReturn
+        | PartyDocumentKind::PurchaseReturn
+        | PartyDocumentKind::CustomerReceipt => {
             return Err(AppError::Validation(format!(
                 "money cannot be applied to a {target_kind} document: returns reduce their parent, they are not collected against"
             )));
@@ -518,7 +520,9 @@ fn target_kind_return_name(target_kind: PartyDocumentKind) -> &'static str {
     match target_kind {
         PartyDocumentKind::Sale => "CustomerReturn",
         PartyDocumentKind::Purchase => "PurchaseReturn",
-        PartyDocumentKind::CustomerReturn | PartyDocumentKind::PurchaseReturn => unreachable!(),
+        PartyDocumentKind::CustomerReturn
+        | PartyDocumentKind::PurchaseReturn
+        | PartyDocumentKind::CustomerReceipt => unreachable!(),
     }
 }
 

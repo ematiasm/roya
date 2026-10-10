@@ -1367,6 +1367,7 @@ where
                 crate::models::PaymentDirection::Out,
                 crate::models::PartyType::Supplier,
                 purchase.supplier_id,
+                (crate::models::PartyDocumentKind::Purchase, purchase_id),
                 method_id,
                 account_id,
                 total,
@@ -1500,6 +1501,7 @@ where
             crate::models::PaymentDirection::Out,
             crate::models::PartyType::Supplier,
             purchase.supplier_id,
+            (crate::models::PartyDocumentKind::Purchase, purchase_id),
             method_id,
             account_id,
             amount,
@@ -1637,6 +1639,10 @@ where
                 )
             })
             .collect();
+        let locator_purchase_id = plan
+            .first()
+            .map(|(purchase_id, _)| *purchase_id)
+            .ok_or_else(|| AppError::Internal("nonzero supplier payment has no allocation target".into()))?;
         let delivery = crate::services::payment_writer::record_delivery_in(
             &self.sequences,
             &self.transactions,
@@ -1647,6 +1653,7 @@ where
             crate::models::PaymentDirection::Out,
             crate::models::PartyType::Supplier,
             supplier_id,
+            (crate::models::PartyDocumentKind::Purchase, locator_purchase_id),
             method_id,
             account_id,
             amount,
@@ -1812,6 +1819,7 @@ where
                 crate::models::PaymentDirection::In,
                 crate::models::PartyType::Supplier,
                 purchase.supplier_id,
+                (crate::models::PartyDocumentKind::Purchase, purchase_id),
                 pay.method_id,
                 pay.account_id,
                 pay.amount,

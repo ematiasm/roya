@@ -928,6 +928,7 @@ where
                 crate::models::PaymentDirection::In,
                 crate::models::PartyType::Customer,
                 customer_return.customer_id,
+                (crate::models::PartyDocumentKind::CustomerReturn, return_id),
                 pay.method_id,
                 pay.account_id,
                 pay.amount,
