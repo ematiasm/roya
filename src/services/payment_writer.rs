@@ -69,6 +69,14 @@ pub async fn record_delivery_in<DR, A, T, PL, PY>(
     direction: crate::models::PaymentDirection,
     party_type: crate::models::PartyType,
     party_id: i64,
+    // The document this delivery's ledger entry NAMES. It is a required parameter
+    // and never inferred, because inferring it from `allocations.first()` is how
+    // four refund and reversal paths came to write `(Sale, 0)` — a document that
+    // does not exist — since a refund deliberately carries no allocation (it does
+    // not APPLY money, it gives it back). A `Payment`/`Refund` entry may be
+    // multiple per document, so this is a locator, not an identity; for a delivery
+    // covering several documents it names the first covered one, the same choice
+    // `pay_supplier` makes with its plan's first purchase.
     document: (crate::models::PartyDocumentKind, i64),
     method_id: i64,
     account_id: i64,
