@@ -9,14 +9,18 @@ customer side, the same residual on the supplier side, and the two RETURN famili
 reads, details and refund plans all come from `payments` + `payment_allocations`.
 **The two return-payment tables now have ZERO production writes and exactly one production
 reader each** — the T1 backfill's two SELECTs (`party_ledger_repo.rs:621`, `:699`).
-**Next is P8** (drop them and re-base that backfill) or **P6** (the collect/pay UI and
-reassignment), whichever is worth more.
+**Next is P8, scoped down to what is unblocked** — the ledger backfill is DELETED (user,
+2026-10-10) and only the two RETURN-payment tables can be dropped; `sale_payments`,
+`purchase_payments` and `customer_receipts` keep production readers whose replacement is
+a P6 decision. See "P8 — the drop is 5 tables, but only TWO of them are unblocked".
+After P8, P6 (collect/pay UI + reassignment), then P7.
 An earlier version of this header claimed the legacy tables had "seven readers": that
 count was wrong, and the correction is recorded under "What P5.3 inherits".
 The earlier `feat/party-ledger-p5` / `-p6` branch plan is dropped: the remaining slices go
 in ONE PR on `feat/party-ledger` (tracker PR
 [#150](https://github.com/ematiasm/roya/pull/150), draft, no merge before P8).
-Branch `feat/party-ledger`, all pushed, at `733acc9`. **Tracker PR open as DRAFT, no merge:
+Branch `feat/party-ledger`, 29 commits ahead of `origin/feat/party-ledger` and NOT
+pushed. **Tracker PR open as DRAFT, no merge:
 [#150](https://github.com/ematiasm/roya/pull/150)**, on issue
 [#149](https://github.com/ematiasm/roya/issues/149). Do NOT merge before P8: merging with
 the legacy tables still in place leaves two homes for the same truth, which is the disease
@@ -514,15 +518,15 @@ Out of scope (follow-ups, recorded so nobody invents them later):
 - [ ] **P7 — Verification pass.** `cargo test --locked`, `cargo check --all-targets`
   (delta vs the 79/49 baseline explained), `git diff --check`, `scripts/e2e.sh`,
   and a real-binary pass over the four business flows of this document.
-- [ ] **P8 — Retire the legacy tables.** The last slice, and it cannot come sooner:
-  drop `sale_payments`, `purchase_payments`, `customer_return_payments`,
-  `purchase_return_payments` and `customer_receipts` in one migration, **only once
-  a grep proves nothing references them** — no SQL, no read, no fixture. It also
-  re-bases `backfill_party_ledger` (party-ledger T1) off those tables and onto
-  `payments`/`payment_allocations` plus the document families, which is a required
-  edit to already-approved code, not an optional cleanup. Tests: the ledger
-  backfill still reproduces balances from the new tables, and the dropped tables
-  are gone from `sqlite_master`.
+- [ ] **P8 — Retire the two return-payment tables.** Re-scoped on 2026-10-10: the ledger
+  backfill is deleted rather than re-based, and the drop covers
+  `customer_return_payments` and `purchase_return_payments` only. Their two money reads
+  move to `PaymentRepository` first, then the legacy repository surface goes, then ONE
+  migration drops both tables once a grep proves nothing references them.
+  `sale_payments`, `purchase_payments` and `customer_receipts` stay: their readers are
+  the document-detail payments list, the payment-as-document listing and the receipt
+  surface, and replacing them is a P6 decision. `payments.receipt_id`'s FK to
+  `customer_receipts` makes THAT drop a table rebuild, so it ships with P6.
 
 ## P5 blocker — the journal entries do not close the identity (measured 2026-10-09)
 
@@ -842,6 +846,18 @@ decisions.
   working. A warning-count drop is the right signal when a new symbol is consumed
   DIRECTLY, not when a layer is inserted in the middle. The count is back to 80/55.
 
+- 2026-10-10 — **P8 was re-scoped by a user decision turned into measurement.** The user
+  chose P8 before P6 and then decided the ledger BACKFILL is deleted rather than re-based
+  (the dev database is wiped; `party_ledger_entries` starts empty). Measuring what that
+  leaves re-drew the slice: only `customer_return_payments` and `purchase_return_payments`
+  can be dropped. `sale_payments`, `purchase_payments` and `customer_receipts` keep
+  production readers — the document-detail payments list, the payment-as-document listing
+  and the whole receipt surface — whose replacement is a P6 decision (what a collection
+  document IS), so they wait for P6 and its table rebuild for `payments.receipt_id`.
+  A first pass at this measured "production references" without cutting each file at its
+  first `#[cfg(test)]`, which is the SAME error the "seven live readers" line made; the
+  corrected count is in "P8 — the drop is 5 tables, but only TWO of them are unblocked".
+
 ## What P5.3 inherits, measured — the legacy tables still have MANY readers
 
 **An earlier revision of this section said "seven live readers". That was WRONG** — it
@@ -926,6 +942,45 @@ manual entry leaves `Refund +` and the balance climbs to `60`. The manual block 
 STAY is the cash leg of `confirm`, which does not use the writer — and that cash leg also
 never created a `payments` row, which is why the residual could not see a cash purchase
 at all.
+
+## P8 — the drop is 5 tables, but only TWO of them are unblocked (measured 2026-10-10)
+
+**Decision (user, 2026-10-10): the ledger backfill is DELETED, not re-based.** The dev
+database is wiped, so `party_ledger_entries` starts empty and nothing needs inventing for
+papers that predate the ledger. That removes the function that held four of the legacy
+readers and it removes the "no such table" hazard the earlier plan called P8's whole
+second half.
+
+Measured consequence, because it re-draws the slice: **P8 cannot drop `sale_payments`,
+`purchase_payments` or `customer_receipts`.** Their production readers are the
+document-detail payments list (`sale_repo.rs:1307` + `find_payment` `:1320`, twin at
+`purchase_repo.rs:1201`/`:1213`), the payment-as-document listing (`sale_repo.rs:1480`,
+`purchase_repo.rs:1372`) and the entire `customer_receipts` surface
+(`CustomerReceiptService::list_receipts`/`get_receipt`/`delete_receipt`, routes
+`/api/customer-receipts*`). Moving them means deciding WHAT a collection document is —
+so they belong to P6, which is where decision 9's replacement gets built. Dropping them
+first would delete the pages that read them.
+
+The two tables this slice CAN retire are `customer_return_payments` and
+`purchase_return_payments`: zero production writes since P5.3c, and their only readers
+are the backfill (deleted here) plus two money reads:
+`customer_return_repo.rs::list_payments` (`:1077`) and `payment_account_and_method`
+(`:1174`), mirrored at `purchase_return_repo.rs:1079`/`:1178`. Their service readers
+(`customer_return.rs:1308`, `purchase_return.rs:1362`) already hold a
+`PaymentRepository` — they resolve deliveries through the journal today — so the move is
+a call swap, not new plumbing.
+
+**Two things the drop has to handle that are not queries:** (1)
+`payments.receipt_id REFERENCES customer_receipts(id) ON DELETE RESTRICT` (migration 47)
+means dropping `customer_receipts` needs a table rebuild, so that edge belongs to P6's
+migration too; (2) the `updated_at` idiom question is VOID here — measured on a
+freshly-migrated sqlite file, the two return-payment tables carry no triggers at all, so
+there is nothing to preserve and no `SET NULL` cascade to worry about.
+
+**Traceability that changes, stated so nobody is surprised:** the backfill stamps a
+refund entry `reference = credit_note_number` while the delivery writer stamps
+`reference = payment_number` (`PAY-…`). Deleting the backfill makes the delivery writer's
+convention universal, which is the one the identity is measured against.
 
 ## P5.3b is blocked on finishing decision 9, not on moving readers (measured 2026-10-09)
 

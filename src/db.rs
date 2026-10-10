@@ -64,18 +64,12 @@ pub async fn create_pool(database_url: &str) -> AppResult<SqlitePool> {
         .await
         .map_err(sqlx::Error::from)?;
 
-    // Migration 42 created the table; THIS fills it (decision 9). It sits
-    // immediately after `migrate!` because it depends on the table existing
-    // and on nothing else having written to it yet: the guard inside is "the
-    // ledger is empty", so on a fresh database it is a no-op and on a database
-    // it has already filled it writes nothing. Document totals are derived in
-    // Rust here — SQLite would do that arithmetic over TEXT decimals in REAL —
-    // and everything runs inside ONE transaction, so a refused or failed
-    // backfill leaves the table empty rather than half-filled.
-    let backfilled = crate::repositories::party_ledger_repo::backfill_party_ledger(&pool).await?;
-    if backfilled > 0 {
-        tracing::info!(entries = backfilled, "party ledger backfilled");
-    }
+    // There is NO ledger backfill here, and its absence is deliberate: every write
+    // path stamps its own entry inside the unit that owns the event, so a database
+    // whose papers were all created by this code needs nothing reconstructed. The
+    // function that used to sit here read the five legacy payment tables, which is
+    // why it had to go before they could be dropped. See
+    // `repositories::party_ledger_repo` for the full reason.
 
     Ok(pool)
 }
