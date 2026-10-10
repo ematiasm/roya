@@ -2,15 +2,17 @@
 
 ## Status
 
-**In progress — P1, P3 (a/b/c/d), P4, P5.1, P5.2a, P5.2b and P5x are DONE; P5.3
-(a/b/c), P6, P7 and P8 remain.** Measured at `7727fa8`: `cargo test --locked` **1567
-passed / 0 failed**, warnings 80 bin / 55 test. The CUSTOMER side reads
-`Σ residuals − unapplied_for_party`; the supplier side is still on `purchase_payments`.
-**Next is P5.3a (the supplier reads) and the plan is spelled out under "What P5.3
-inherits"**, which is also where an earlier claim of mine is corrected: the legacy tables
-do NOT have seven readers, they have dozens across all five tables, because the first
-count mixed `#[cfg(test)] mod tests` hits with production code. Read that section before
-starting; the drop cannot happen until every row of that table moves.
+**In progress — every slice of P5 is DONE; P6, P7 and P8 remain.** Measured at
+`ac57275`: `cargo test --locked` **1570 passed / 0 failed**, warnings 82 bin / 56 test.
+Both sides read the journal: `balance == Σ residuals − unapplied_for_party` on the
+customer side, the same residual on the supplier side, and the two RETURN families' money
+reads, details and refund plans all come from `payments` + `payment_allocations`.
+**The two return-payment tables now have ZERO production writes and exactly one production
+reader each** — the T1 backfill's two SELECTs (`party_ledger_repo.rs:621`, `:699`).
+**Next is P8** (drop them and re-base that backfill) or **P6** (the collect/pay UI and
+reassignment), whichever is worth more.
+An earlier version of this header claimed the legacy tables had "seven readers": that
+count was wrong, and the correction is recorded under "What P5.3 inherits".
 The earlier `feat/party-ledger-p5` / `-p6` branch plan is dropped: the remaining slices go
 in ONE PR on `feat/party-ledger` (tracker PR
 [#150](https://github.com/ematiasm/roya/pull/150), draft, no merge before P8).
