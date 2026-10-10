@@ -969,6 +969,25 @@ What IS free: the three `COUNT(*)` guards per repository are inside `mod tests` 
 module starts at `customer_return_repo.rs:1086`), and `payment_account_and_method`
 (`:1174`/`:1178`) has no callers at all — dead code that goes on its own.
 
+## P5.3b-3's mechanism, decided (measured 2026-10-09)
+
+The `cancel` refuses a partially-applied reversal by counting the legacy rows that link
+one (`customer_return.rs:848-856`, `p.refund_transaction_id.is_some()`). `payments` has no
+`refund_transaction_id`, and migration 19 gave that column to three legacy tables
+(`sale_payments`, `purchase_payments`, and the two return tables) with the same shape:
+`INTEGER NULL REFERENCES transactions(id) ON DELETE RESTRICT`.
+
+So the replacement is a column of the same name and shape on `payments`, added by
+migration 48, following the precedent migration 47 set for `receipt_id`: one nullable
+edge, `ON DELETE RESTRICT`, plus its index. That keeps the guard's MEANING (which refund
+of this document has already been given back) where the guard looks for it, and lets the
+legacy column go with its table.
+
+The alternative — deriving the link from the journal — was considered and rejected: the
+`Refund` entry the confirm writes and the `Payment` entry the cancel writes both carry
+`(document_kind, document_id)` for the return, but nothing distinguishes *which* refund
+delivery a given reversal answers, which is exactly the count the guard needs.
+
 ## Resume here
 
 1. Read decisions 1–9 above before touching anything: three of them (2, 8, 9) are
