@@ -934,8 +934,8 @@ async fn web_confirm_customer_return(
     // and a malformed one must answer in the operator's language.
     let _form = form_or_refusal(form, &localization)?;
     // **No method field.** `confirm` resolves the refunds PER ORIGINATING ACCOUNT
-    // from the parent's payment rows, and `customer_return_payments` has no
-    // `payment_type` column (decision 7 of the design): a credit note's refunds are
+    // from the parent's payment rows, and the refund row this route used to keep
+    // had no `payment_type` column (decision 7 of the design): a credit note's refunds are
     // determined entirely by the parent's payments, so posting a second copy of
     // that flag would be a value that could disagree with the rows it summarizes.
     state

@@ -613,12 +613,17 @@ where
         //
         // Everything from here to the COMMIT is ONE transaction: the sequence
         // number, one stock movement per tracked line, one Expense per planned
-        // refund, the `customer_return_payments` rows, and `set_confirmed`.
+        // refund, the refund's `payments` delivery, and `set_confirmed`.
         //
         // EVERY repository call inside is an `_in` form. On a credit note this
         // matters MORE than on a purchase: the refund is an EXPENSE, so the unit
         // is what stops the shop having taken the goods back and then failed to
         // pay for them — or worse, paid for them and failed to take the goods.
+        //
+        // ONE thing left this comment: the refund's own row in
+        // `customer_return_payments`, which migration 49 dropped. The refund is a
+        // `payments` delivery now, written through `payment_writer` in this same
+        // unit, so the money is still all-or-nothing with the goods.
         //
         // **NO SATELLITE WRITE, by decision 2 of the design.** A credit note does
         // not touch `product_supplier_costs`, in any step and in either
@@ -1118,6 +1123,24 @@ mod tests {
 
     async fn svc() -> (Svc, SqlitePool) {
         svc_with_flags(true, true).await
+    }
+
+    /// Migration 49 dropped the table this family used to keep its refunds in,
+    /// and the assertion is the whole point: `sqlx::migrate!` embeds the file at
+    /// COMPILE time, so a stale binary keeps a stale schema and every other test
+    /// in this module would still pass against it. A missing table is checked
+    /// rather than the absence of an error from a query nobody runs.
+    #[tokio::test]
+    async fn the_return_payment_table_is_gone_from_the_schema() {
+        let (_s, pool) = svc().await;
+        let found: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind("customer_return_payments")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(found, 0, "migration 49 must have dropped it");
     }
 
     fn dec(s: &str) -> Decimal {
@@ -2961,13 +2984,20 @@ mod tests {
             tx_before,
             "the reversal movement must die with the unit"
         );
+        // The refund delivery's reversal, counted where it now lives: the
+        // journal. `payment_repo` reads it as `count_reversals_for_document`,
+        // and the same SQL is inlined here on purpose — a test that reaches for
+        // the production method would pass even if that method stopped looking
+        // at the rows this test is about.
         let reversals: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM customer_return_payments WHERE refund_transaction_id IS NOT NULL",
+            "SELECT COUNT(*) FROM party_ledger_entries \
+             WHERE kind = 'Payment' AND document_kind = 'CustomerReturn' AND document_id = ?",
         )
+        .bind(p.return_id)
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(reversals, 0, "and no row claims one");
+        assert_eq!(reversals, 0, "and no entry claims one");
         assert_eq!(
             row_state(&pool, p.return_id).await.0,
             "Confirmed",

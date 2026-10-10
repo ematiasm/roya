@@ -71,7 +71,6 @@ pub trait PartyLedgerRepository: Send + Sync {
         party_type: PartyType,
         party_id: i64,
     ) -> AppResult<Vec<PartyLedgerEntry>>;
-
 }
 
 #[derive(Clone)]
@@ -255,7 +254,6 @@ impl PartyLedgerRepository for SqlitePartyLedgerRepository {
         tx.commit().await?;
         Ok(entries)
     }
-
 }
 
 // ---------------------------------------------------------------------------

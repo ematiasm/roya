@@ -945,51 +945,13 @@ mod tests {
         (account, method)
     }
 
-    // -- migration 44 EXEMPTS this table, deliberately: a refund does not
-    // CHOOSE a (account, method) pair, it REPLAYS the parent payment's pair so
-    // the money comes back out of the box it went into (`RefundPlan` copies
-    // pay.account_id / pay.method_id by design, services/customer_return.rs).
-    // When a method is re-pointed after the parent's birth, a legitimate
-    // refund row is born mismatched against the method's CURRENT owner — and
-    // must still insert. This pin names the reason so the next reader cannot
-    // mistake the absence of a guard for an oversight; the residual hole (a
-    // direct SQL insert here can name any account) is accepted and recorded
-    // in the migration header.
-
-    #[tokio::test]
-    async fn a_credit_note_refund_row_is_exempt_from_the_method_account_guard() {
-        let pool = memory_pool().await;
-        let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let (customer, sale, _line) = seed_parent(&pool, "guard buyer", d(2024, 6, 1), actor).await;
-        let ret =
-            seed_return_with_status(&pool, "Draft", customer, sale, d(2024, 6, 2), actor).await;
-        let (account, _method) = owned_pair(&pool, "wallet one").await;
-        let (_, foreign_method) = owned_pair(&pool, "wallet two").await;
-        // Born MISMATCHED against the method's current owner, exactly what a
-        // refund replays after the method has been re-pointed.
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO customer_return_payments (return_id, account_id, method_id, amount, date, created_by)\n             VALUES (?, ?, ?, '5', '2024-06-02', ?) RETURNING id",
-        )
-        .bind(ret)
-        .bind(account)
-        .bind(foreign_method)
-        .bind(actor)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let (stored_account, stored_method): (i64, i64) = sqlx::query_as(
-            "SELECT account_id, method_id FROM customer_return_payments WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(
-            (stored_account, stored_method),
-            (account, foreign_method),
-            "the replayed pair was written, mismatched and all"
-        );
-    }
+    // The migration 44 exemption for a replayed (account, method) pair no
+    // longer needs a pin HERE: the pair does not live in a return-payment row
+    // any more. A refund IS a `payments` delivery, exempt by (party, direction)
+    // in migration 48, and the pin that proves it runs through the real confirm
+    // path — `a_refund_replays_the_parent_payments_account_even_after_the_method_is_repointed`
+    // in `services::{customer_return,purchase_return}`. Migration 49 dropped this
+    // table, so a test here would pin a shape nothing writes.
 
     async fn memory_pool() -> SqlitePool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")

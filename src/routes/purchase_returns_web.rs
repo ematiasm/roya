@@ -998,8 +998,8 @@ async fn web_confirm_purchase_return(
     // `form_or_refusal`.
     let _form = form_or_refusal(form, &localization)?;
     // **No method field.** `confirm` resolves the refunds PER ORIGINATING
-    // ACCOUNT from the parent's payment rows, and `purchase_return_payments` has
-    // no `payment_type` column (decision 7): a return's refunds are determined
+    // ACCOUNT from the parent's payment rows, and the refund row this route used to
+    // keep had no `payment_type` column (decision 7): a return's refunds are determined
     // entirely by the parent's payments, so storing or posting a second copy of
     // that flag would be a value that could disagree with the rows it summarizes.
     state
