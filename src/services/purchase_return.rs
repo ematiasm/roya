@@ -852,16 +852,30 @@ where
         // rather than passed in, and before any write so a missing parent refuses early.
         let purchase = self.confirmed_parent(purchase_return.purchase_id).await?;
 
-        // A partially-applied reversal is REFUSED, not doubled: a second pass
-        // would move the goods back in again and reverse every refund twice.
-        let partial = payments
-            .iter()
-            .filter(|p| p.refund_transaction_id.is_some())
-            .count();
-        if partial > 0 {
+        // The journal is the source for both counts: Refund entries are the
+        // deliveries (M), and Payment entries are reversals already applied (N).
+        let deliveries = self
+            .payments
+            .list_refunds_for_document(crate::models::PartyDocumentKind::PurchaseReturn, return_id)
+            .await?;
+        let reversals = self
+            .payments
+            .count_reversals_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                return_id,
+            )
+            .await?;
+        if reversals > 0 {
             return Err(AppError::Validation(format!(
-                "reversal already partially applied: {partial} of {} refunds already link a reversal; \
+                "reversal already partially applied: {reversals} of {} refunds already link a reversal; \
                  refusing to return the goods a second time or duplicate the reversal",
+                deliveries.len()
+            )));
+        }
+        if deliveries.len() != payments.len() {
+            return Err(AppError::Internal(format!(
+                "internal inconsistency reversing purchase return {return_id}: {} journal refund deliveries but {} legacy payment rows",
+                deliveries.len(),
                 payments.len()
             )));
         }
@@ -880,7 +894,7 @@ where
                 tracked.push((line.clone(), parent));
             }
         }
-        for pay in &payments {
+        for pay in &deliveries {
             if !self.transactions.accounts.exists(pay.account_id).await? {
                 return Err(AppError::NotFound(format!(
                     "account {} not found",
@@ -920,7 +934,9 @@ where
         // return's money is an `Expense`, and it is why a reversal can be refused for
         // want of funds where the confirm never could — the pre-checks above are what
         // refuse it, before anything is written.
-        for pay in &payments {
+        // Lengths were checked before entering the write unit; zip is now a
+        // one-to-one pairing with the legacy rows needed by the detail reader.
+        for (pay, legacy_payment) in deliveries.iter().zip(&payments) {
             let reversal_delivery = crate::services::payment_writer::record_delivery_in(
                 &self.sequences,
                 &self.transactions,
@@ -945,8 +961,10 @@ where
             let reversal_id = reversal_delivery
                 .transaction_id
                 .ok_or_else(|| AppError::Internal("reversal delivery has no movement".into()))?;
+            // Keep the legacy row faithful for existing detail readers until b-4
+            // drops that table; the cancel guard now reads the journal instead.
             self.returns
-                .set_payment_refund_transaction_in(&mut tx, actor, pay.id, reversal_id)
+                .set_payment_refund_transaction_in(&mut tx, actor, legacy_payment.id, reversal_id)
                 .await?;
         }
 
@@ -1009,6 +1027,7 @@ mod tests {
     use crate::models::{NewProduct, PaymentStatus, ProductKind};
     use crate::repositories::{
         purchase_return_repo::PurchaseReturnListFilter, PurchaseReturnRepository,
+        PaymentRepository,
         SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
         SqliteDocSequenceRepository, SqliteProductRepository, SqlitePurchaseRepository,
         SqlitePurchaseReturnRepository, SqliteStockMovementRepository, SqliteTransactionRepository,
@@ -3140,6 +3159,134 @@ mod tests {
             3,
             "nothing moved a second time"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refund_entry_that_is_not_a_payment_number_is_refused_rather_than_dropped() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "BACKFILL-REF",
+            "Backfill Reference Supplier",
+            "3",
+            "4",
+            &[("backfill reference wallet", "12")],
+            "2",
+        )
+        .await;
+        let who = actor(&pool).await;
+        s.confirm(who, p.return_id).await.unwrap();
+
+        let (supplier_id, document_number): (i64, String) = sqlx::query_as(
+            "SELECT supplier_id, return_number FROM purchase_returns WHERE id = ?",
+        )
+        .bind(p.return_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let normal = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(normal.len(), 1, "the payment-number reference resolves");
+
+        // The T1 backfill shape uses the document number in reference, not the
+        // payment number. The journal is append-only, so exercise it with INSERT.
+        sqlx::query(
+            "INSERT INTO party_ledger_entries \
+             (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by) \
+             VALUES ('Supplier', ?, 'Refund', '1', 'PurchaseReturn', ?, '2024-06-01', ?, ?)",
+        )
+        .bind(supplier_id)
+        .bind(p.return_id)
+        .bind(&document_number)
+        .bind(who)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Internal(message) => {
+                assert!(message.contains("2 Refund journal entries"), "{message}");
+                assert!(message.contains("1 payment deliveries resolved"), "{message}");
+                assert!(message.contains("reference may not be a payment number"), "{message}");
+                assert!(message.contains("T1 backfill"), "{message}");
+            }
+            other => panic!("expected internal inconsistency, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_purchase_return_refuses_a_journal_recorded_partial_reversal() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "PARTIAL-CANCEL",
+            "Partial Cancel Supplier",
+            "3",
+            "4",
+            &[("partial cancel wallet", "12")],
+            "2",
+        )
+        .await;
+        let who = actor(&pool).await;
+        s.confirm(who, p.return_id).await.unwrap();
+        let stock_before = s.inventory.stock_for_decision(p.product_id).await.unwrap();
+        let transactions_before = tx_count(&pool).await;
+        let supplier_id: i64 =
+            sqlx::query_scalar("SELECT supplier_id FROM purchase_returns WHERE id = ?")
+                .bind(p.return_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO party_ledger_entries \
+             (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by) \
+             VALUES ('Supplier', ?, 'Payment', '-12', 'PurchaseReturn', ?, '2024-06-01', 'simulated reversal', ?)",
+        )
+        .bind(supplier_id)
+        .bind(p.return_id)
+        .bind(who)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for _ in 0..2 {
+            match s.cancel(who, p.return_id, None).await.unwrap_err() {
+                AppError::Validation(msg) => {
+                    assert!(
+                        msg.contains("1 of 1"),
+                        "the journal residual is counted: {msg}"
+                    );
+                    assert!(msg.contains("already partially applied"), "{msg}");
+                }
+                other => panic!("expected Validation, got {other:?}"),
+            }
+            assert_eq!(
+                s.inventory.stock_for_decision(p.product_id).await.unwrap(),
+                stock_before,
+                "a refused retry must not move the goods again"
+            );
+            assert_eq!(
+                tx_count(&pool).await,
+                transactions_before,
+                "a refused retry must not reverse money again"
+            );
+        }
     }
 
     /// A Draft return is discarded, not reversed: it never moved goods or money,

@@ -75,6 +75,22 @@ pub trait PaymentRepository: Send + Sync {
     /// remainder — the credit — because no allocation carries it.
     async fn list_for_receipt(&self, receipt_id: i64) -> AppResult<Vec<Payment>>;
 
+    /// Refund deliveries recorded in the party journal for one document. An
+    /// unknown document has no matching entries and therefore returns an empty list.
+    async fn list_refunds_for_document(
+        &self,
+        document_kind: PartyDocumentKind,
+        document_id: i64,
+    ) -> AppResult<Vec<Payment>>;
+
+    /// The number of refund deliveries for this document already reversed in the
+    /// journal. This count pairs with `list_refunds_for_document`'s delivery count.
+    async fn count_reversals_for_document(
+        &self,
+        document_kind: PartyDocumentKind,
+        document_id: i64,
+    ) -> AppResult<i64>;
+
     /// The shares of one payment, oldest first.
     async fn list_allocations(&self, payment_id: i64) -> AppResult<Vec<PaymentAllocation>>;
 
@@ -690,6 +706,59 @@ impl PaymentRepository for SqlitePaymentRepository {
             .fetch_all(&self.pool)
             .await?;
         rows.into_iter().map(row_to_payment).collect()
+    }
+
+    async fn list_refunds_for_document(
+        &self,
+        document_kind: PartyDocumentKind,
+        document_id: i64,
+    ) -> AppResult<Vec<Payment>> {
+        let qualified_columns = PAYMENT_COLUMNS
+            .split(", ")
+            .map(|column| format!("p.{column}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {qualified_columns} FROM party_ledger_entries e \
+             JOIN payments p ON p.number = e.reference \
+             WHERE e.kind = 'Refund' AND e.document_kind = ? AND e.document_id = ? \
+             ORDER BY e.id"
+        );
+        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(document_kind.to_string())
+            .bind(document_id)
+            .fetch_all(&self.pool)
+            .await?;
+        let resolved_count = rows.len();
+        let entry_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM party_ledger_entries \
+             WHERE kind = 'Refund' AND document_kind = ? AND document_id = ?",
+        )
+        .bind(document_kind.to_string())
+        .bind(document_id)
+        .fetch_one(&self.pool)
+        .await?;
+        if entry_count != resolved_count as i64 {
+            return Err(AppError::Internal(format!(
+                "internal inconsistency for {document_kind} {document_id}: {entry_count} Refund journal entries but {resolved_count} payment deliveries resolved; a Refund entry reference may not be a payment number (as produced by the T1 backfill, which uses the document number). This is not an operator error."
+            )));
+        }
+        rows.into_iter().map(row_to_payment).collect()
+    }
+
+    async fn count_reversals_for_document(
+        &self,
+        document_kind: PartyDocumentKind,
+        document_id: i64,
+    ) -> AppResult<i64> {
+        Ok(sqlx::query_scalar(
+            "SELECT COUNT(*) FROM party_ledger_entries \
+             WHERE kind = 'Payment' AND document_kind = ? AND document_id = ?",
+        )
+        .bind(document_kind.to_string())
+        .bind(document_id)
+        .fetch_one(&self.pool)
+        .await?)
     }
 
     async fn list_allocations(&self, payment_id: i64) -> AppResult<Vec<PaymentAllocation>> {
