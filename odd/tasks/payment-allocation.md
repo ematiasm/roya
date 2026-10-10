@@ -2,18 +2,23 @@
 
 ## Status
 
-**In progress — every slice of P5 is DONE; P6, P7 and P8 remain.** Measured at
-`ac57275`: `cargo test --locked` **1570 passed / 0 failed**, warnings 82 bin / 56 test.
-Both sides read the journal: `balance == Σ residuals − unapplied_for_party` on the
-customer side, the same residual on the supplier side, and the two RETURN families' money
-reads, details and refund plans all come from `payments` + `payment_allocations`.
-**The two return-payment tables now have ZERO production writes and exactly one production
-reader each** — the T1 backfill's two SELECTs (`party_ledger_repo.rs:621`, `:699`).
-**Next is P8, scoped down to what is unblocked** — the ledger backfill is DELETED (user,
-2026-10-10) and only the two RETURN-payment tables can be dropped; `sale_payments`,
-`purchase_payments` and `customer_receipts` keep production readers whose replacement is
-a P6 decision. See "P8 — the drop is 5 tables, but only TWO of them are unblocked".
-After P8, P6 (collect/pay UI + reassignment), then P7.
+**In progress — P5 and P8 are DONE; P6 and P7 remain.** Measured at `7b17e68`:
+`cargo test --locked` **1568 passed / 0 failed**, `scripts/e2e.sh` **180 passed / 5
+skipped**, warnings 82 bin. Both sides read the journal: `balance == Σ residuals −
+unapplied_for_party` on the customer side, the same residual on the supplier side, and the
+two RETURN families' money reads, details and refund plans all come from `payments` +
+`payment_allocations`.
+
+**P8 landed, scoped to what was unblocked.** The ledger backfill is DELETED (user,
+2026-10-10) and `customer_return_payments` + `purchase_return_payments` are dropped by
+migration 49, with a vacuity guard verified against real sqlite. Only those two could go:
+`sale_payments`, `purchase_payments` and `customer_receipts` keep production readers — the
+document-detail payments list, the payment-as-document listing and the whole receipt
+surface — and replacing them means deciding what a collection document IS, which is P6.
+`payments.receipt_id`'s FK to `customer_receipts` makes THAT drop a table rebuild, and it
+ships with P6 too. See "P8 landed — what the drop did, and the three edges that hold the
+other three tables".
+After P6 (collect/pay UI + reassignment), P7 is the verification pass.
 An earlier version of this header claimed the legacy tables had "seven readers": that
 count was wrong, and the correction is recorded under "What P5.3 inherits".
 The earlier `feat/party-ledger-p5` / `-p6` branch plan is dropped: the remaining slices go
@@ -518,11 +523,9 @@ Out of scope (follow-ups, recorded so nobody invents them later):
 - [ ] **P7 — Verification pass.** `cargo test --locked`, `cargo check --all-targets`
   (delta vs the 79/49 baseline explained), `git diff --check`, `scripts/e2e.sh`,
   and a real-binary pass over the four business flows of this document.
-- [ ] **P8 — Retire the two return-payment tables.** Re-scoped on 2026-10-10: the ledger
-  backfill is deleted rather than re-based, and the drop covers
-  `customer_return_payments` and `purchase_return_payments` only. Their two money reads
-  move to `PaymentRepository` first, then the legacy repository surface goes, then ONE
-  migration drops both tables once a grep proves nothing references them.
+- [x] **P8 — Retire the two return-payment tables.** Done at `7b17e68` and `7222a4c`.
+  The ledger backfill is deleted, not re-based, and migration 49 drops
+  `customer_return_payments` and `purchase_return_payments` behind a vacuity guard.
   `sale_payments`, `purchase_payments` and `customer_receipts` stay: their readers are
   the document-detail payments list, the payment-as-document listing and the receipt
   surface, and replacing them is a P6 decision. `payments.receipt_id`'s FK to
@@ -858,6 +861,17 @@ decisions.
   first `#[cfg(test)]`, which is the SAME error the "seven live readers" line made; the
   corrected count is in "P8 — the drop is 5 tables, but only TWO of them are unblocked".
 
+- 2026-10-10 — **P8 landed in two commits.** Re-scoped first by measurement: the
+  production-reference count that included test code made the two return families look
+  blocked when P5.3b-4/-5 had already freed them. `7222a4c` deletes the ledger backfill
+  (and `PartyLedgerRepository::count`, whose only caller was its emptiness guard) and
+  `7b17e68` adds migration 49, which drops `customer_return_payments` and
+  `purchase_return_payments` behind a vacuity guard verified against real sqlite inside a
+  transaction. `sale_payments`, `purchase_payments` and `customer_receipts` stay for P6:
+  their readers are the per-document payments list, the payment-as-document listing and
+  the receipt surface, and `payments.receipt_id` makes the last drop a table rebuild.
+  Measured at `7b17e68`: 1568 tests / 0 failed, e2e 180 passed / 5 skipped, warnings 82.
+
 ## What P5.3 inherits, measured — the legacy tables still have MANY readers
 
 **An earlier revision of this section said "seven live readers". That was WRONG** — it
@@ -943,7 +957,55 @@ STAY is the cash leg of `confirm`, which does not use the writer — and that ca
 never created a `payments` row, which is why the residual could not see a cash purchase
 at all.
 
-## P8 — the drop is 5 tables, but only TWO of them are unblocked (measured 2026-10-10)
+## P8 landed — what the drop did, and the three edges that hold the other three tables
+
+Measured 2026-10-10, at `7222a4c` (the backfill) and `7b17e68` (the drop). The scope was
+set by two user decisions: the ledger backfill is DELETED rather than re-based (the dev
+database is wiped, so `party_ledger_entries` starts empty and nothing needs inventing for
+papers that predate the ledger), and `cancel` stays out of it.
+
+**The first measurement was wrong, in the exact way this document already warns about.**
+A pass counting "production references" without cutting each file at its first
+`#[cfg(test)]` reported `sale_payments` 49, `purchase_payments` 27, `customer_receipts`
+17 — and nearly all of it was test code in files that also hold production code, which is
+the SAME error the "seven live readers" line made. The corrected walk, which stops at each
+file's first test module and treats `smoke_tests.rs` / `t1_schema_tests.rs` /
+`localization_tests.rs` as wholly test, leaves FIVE prose comments and NOT ONE query.
+So the two return families were already free, and P5.3b-4/-5 had done it: the old plan's
+"P5.3b — the return families' reads" was stale prose, not pending work.
+
+**What actually blocked each table:**
+
+| Table | What holds it |
+|---|---|
+| `customer_return_payments`, `purchase_return_payments` | Nothing. Dropped by migration 49. |
+| `sale_payments`, `purchase_payments` | The document-detail payments list (`sale_repo.rs:1307` + `find_payment` `:1320`, twin at `purchase_repo.rs:1201`/`:1213`, consumed by `assemble_detail` and `find_payment`) and the payment-as-document listing (`sale_repo.rs:1480`, `purchase_repo.rs:1372`). Both render a money breakdown per LEGACY ROW with its own account; the replacement is per-delivery, which are P6's screens. |
+| `customer_receipts` | The whole `CustomerReceiptService` surface (`list_receipts`, `get_receipt`, `delete_receipt`, routes `/api/customer-receipts*` and `/web/customers/{id}/receipts`) plus `payments.receipt_id REFERENCES customer_receipts(id) ON DELETE RESTRICT` from migration 47. |
+
+**Three things the drop required that are not queries:** (1) `payments.receipt_id`'s FK makes
+dropping `customer_receipts` a table REBUILD, so it needs migration 45's child-trigger
+choreography; (2) the `updated_at` idiom question is VOID for the two dropped tables —
+measured on a freshly-migrated sqlite file, neither carries a trigger at all, so there was
+nothing to preserve; (3) two tests pinned only the table and both are REPLACED rather than
+deleted — the migration 44 exemption now belongs to `payments` and is already pinned
+end-to-end by the refund-replay test in both return services, and the cancel-atomicity
+assertion now counts reversal entries in `party_ledger_entries`, inlined on purpose so it
+cannot pass through a production method that stopped looking.
+
+**Traceability that changed, so nobody is surprised:** the backfill stamped a refund entry
+`reference = credit_note_number` while the delivery writer stamps `reference = payment_number`
+(`PAY-…`). Deleting the backfill makes the delivery writer's convention universal, which is
+the one the identity is measured against.
+
+**The vacuity guard needed a real measurement to be trusted, and the first probe lied.**
+Running the migration through the `sqlite3` CLI with a row seeded printed the CHECK failure
+AND left the tables dropped — because the CLI was not in a transaction and SQLite does not
+abort a script on error. `sqlx` wraps every migration in a transaction unless the file says
+`-- no-transaction` (`sqlx-sqlite` `migrate.rs`), so the guard IS a gate; re-run with an
+explicit BEGIN it aborts and the rollback leaves both the table and its row intact. A guard
+verified through a driver that behaves differently from the real one is not verified.
+
+## P8 — the drop was 5 tables, but only TWO were unblocked (measured 2026-10-10)
 
 **Decision (user, 2026-10-10): the ledger backfill is DELETED, not re-based.** The dev
 database is wiped, so `party_ledger_entries` starts empty and nothing needs inventing for
@@ -1087,16 +1149,28 @@ pin it for the other two families by simulating the residual.
    the ones a future agent will otherwise "improve" back into the old shape. Decision
    4 was REFINED (the cap has two homes; a payment's amount freezes once allocated)
    and the refinement is measured, not argued.
-2. **P5 is the next unit again, and it is ONE task: the reads, the legacy deletion and
-   `unapplied_for_party`.** Read "P5 blocker" before starting: the journal blocker was
-   real, and the two user decisions of 2026-10-09 dissolved it rather than leaving it to
-   P5. The legacy dual-write is DELETED, not retired in P8 — which is why P5 and that
-   half of P8 are the same change: the first fold to break when the rows go is the one
-   being replaced. `unapplied_for_party` must filter `direction='In'`, or an `Out` refund
-   counts its whole amount as available credit. `target_residual_due`
-   (`payment_repo.rs:270`) also has to be re-based here, since it keeps a second copy of
-   the document's total.
-3. **`cancel` is being RETIRED as a business action (user, 2026-10-09), and that is its
+2. **P5 and P8 are DONE. P6 is the next unit, and it is the one with undecided edges.**
+   P6's scope in "Tasks" is the collect/pay screen plus REASSIGNMENT, and the reassignment
+   is a WRITE THAT DOES NOT EXIST: `UPDATE payment_allocations` appears in no Rust file and
+   in no migration, while decision 3 promised it and migration 46 already built the
+   `BEFORE UPDATE` guard waiting for it. Its cap has THREE sides (residual of A, residual
+   of B, the payment's total) and they must hold in ONE unit, because a delete-then-insert
+   passes through a state where the same money is applied twice.
+   P6 also OWNS the three tables P8 left behind: `sale_payments`/`purchase_payments` feed
+   the per-document payments list and the payment-as-document listing, and
+   `customer_receipts` is the receipt surface whose FK (`payments.receipt_id`) makes its
+   drop a table rebuild. Deciding what a collection document IS comes before either.
+   Two landed behaviours P6 must not undo: `unapplied_for_party` filters `direction='In'`
+   on purpose (an `Out` refund would otherwise count its whole amount as available
+   credit), and `target_residual_due` (`payment_repo.rs:270`) keeps a SECOND copy of the
+   document's total — the one seam of this work that is still duplicated by design and is
+   worth reconsidering when P6 touches the reads.
+3. **P8 is DONE and it left three tables behind on purpose.** `sale_payments`,
+   `purchase_payments` and `customer_receipts` have live readers, and replacing them is
+   P6's own decision (what a collection document IS). Do NOT drop them as a cleanup
+   follow-up; see "P8 landed — what the drop did, and the three edges that hold the other
+   three tables" for the exact reader of each.
+4. **`cancel` is being RETIRED as a business action (user, 2026-10-09), and that is its
    own feature, NOT part of P5.** A Confirmed document is corrected with a mirror
    document; only a Draft is removed. Measured scope, so it is not underestimated: 4
    service methods (206 + 155 + 145 + 142 lines), their web and API routes, the
@@ -1106,19 +1180,17 @@ pin it for the other two families by simulating the residual.
    before P5, because P5 is what proves the money model it leans on, and it removes the
    last journal hole rather than adding to it. `delete_draft` and `cancel`-on-a-Draft do
    the same thing today (`customer_return.rs:811`), so the work picks one.
-4. **Expect three or four tests to fail on purpose when P5 lands, and they are not
-   regressions.** They were written as the reminder: the most visible is
-   `over_collection_becomes_the_customers_credit` (`src/services/customer_receipts.rs:1374`)
-   asserting `customer_balance == 0` with a comment saying P5 will make it `-1`, and
-   the same caveat in `src/routes/customers_api.rs:1147`. Read the assertion message
-   before "fixing" it. Conversely `k3_ac8_fully_paid_and_cancelled_sales_leave_the_balance`
-   (`src/services/sales.rs:5099`) already asserts the RIGHT answer for an annulled
-   document, so P5 must keep it green rather than relax it — and it will be re-derived
-   once `cancel` is retired, because the fixture that builds it stops existing.
-4. **P8 is not a cleanup**: `backfill_party_ledger` (party-ledger T1, reviewed with its
-   authority burned) READS the five legacy tables, so dropping them requires re-basing
-   it onto `payments`/`payment_allocations` or the startup fails with "no such table".
-5. The two refund caps of party-ledger T2 (`customer_return`, `purchase_return`) are
+5. **The four assertions P5 was supposed to break landed as predicted**, and their
+   final numbers are the identity's own: `over_collection_becomes_the_customers_credit`
+   reports `-1` after a 31 collection of a 30 sale, and `0` after a second 20 sale
+   collected with 19 (residual 1 offset by the 1 of credit still held).
+   `k3_ac8_fully_paid_and_cancelled_sales_leave_the_balance` stayed green: an annulled
+   document asserts the correct answer and was not relaxed. It WILL be re-derived when
+   `cancel` is retired, because its fixture stops existing.
+6. **The backfill question is CLOSED**: it is deleted, not re-based (user, 2026-10-10).
+   Its two tests went with it; do not reintroduce one without a reason that is not "a
+   safety net", because every write path stamps its own entry inside its owning unit.
+7. The two refund caps of party-ledger T2 (`customer_return`, `purchase_return`) are
    still NOT lifted, deliberately: lifting them needs a decision nobody has written
    ("what replaces *this app has no credit balance*"). See T2 in
    `odd/tasks/party-ledger.md`.
