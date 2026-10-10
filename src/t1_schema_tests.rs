@@ -541,8 +541,11 @@ async fn repositories_stamp_technical_update_time_on_every_actor_mutation() {
         .await
         .unwrap();
     set_updated_at(&pool, "payment_methods", method.id).await;
+    // Migration 45 removed the unowned state, so the mutation this assertion
+    // provokes is the one the editor now performs on an unticked method: it is
+    // deactivated and keeps its owner.
     method_repo
-        .set_method_account(actor, method.id, None)
+        .set_active(actor, method.id, false)
         .await
         .unwrap();
     assert!(
@@ -551,6 +554,15 @@ async fn repositories_stamp_technical_update_time_on_every_actor_mutation() {
             .as_str()
             > "2000-01-01T00:00:00.000Z"
     );
+
+    // The payment steps below pair a method with `account`, and migration 44
+    // guards that pair on the payment row: the deactivated method above must not
+    // be the one the payments name, so the fixture gives them a freshly created
+    // method the account owns, leaving the deactivation asserted above standing.
+    let payment_method = method_repo
+        .create_in_account(actor, "T1 Payment Method", account.id)
+        .await
+        .unwrap();
 
     let transaction_repo = SqliteTransactionRepository::new(pool.clone());
     let mut transaction = transaction_repo
@@ -632,7 +644,7 @@ async fn repositories_stamp_technical_update_time_on_every_actor_mutation() {
             actor,
             sale_id,
             account.id,
-            method.id,
+            payment_method.id,
             Decimal::from(5),
             date,
             None,
@@ -669,7 +681,7 @@ async fn repositories_stamp_technical_update_time_on_every_actor_mutation() {
             actor,
             purchase_id,
             account.id,
-            method.id,
+            payment_method.id,
             Decimal::from(5),
             date,
             None,
@@ -686,5 +698,142 @@ async fn repositories_stamp_technical_update_time_on_every_actor_mutation() {
             .await
             .as_str()
             > "2000-01-01T00:00:00.000Z"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// T6 of `odd/tasks/payment-method-single-account.md`: the migration that makes
+// `payment_methods.account_id NOT NULL` and seeds the default pair.
+// ---------------------------------------------------------------------------
+
+/// (a) A fresh database opens collectable: exactly one account (`Caja`) with
+/// the `Cash` method owned by it, and a sale payment through that pair
+/// satisfies the migration-44 guard. Fails today because no migration seeds an
+/// account and every seeded method is unassigned.
+#[tokio::test]
+async fn t6_fresh_database_seeds_a_caja_account_owning_cash_and_a_payment_through_it_succeeds() {
+    let pool = pool().await;
+    let actor = sentinel(&pool).await;
+
+    let accounts: Vec<(i64, String)> = sqlx::query_as("SELECT id, name FROM accounts ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        accounts.len(),
+        1,
+        "a fresh install opens with one default account: {accounts:?}"
+    );
+    assert_eq!(accounts[0].1, "Caja", "the default account is named Caja");
+    let caja = accounts[0].0;
+
+    let cash: i64 = sqlx::query_scalar(
+        "SELECT id FROM payment_methods WHERE name = 'Cash' ORDER BY id LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let owner: Option<i64> =
+        sqlx::query_scalar("SELECT account_id FROM payment_methods WHERE id = ?")
+            .bind(cash)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(owner, Some(caja), "Cash belongs to Caja after the seed");
+
+    // The seed-created account is attributed, like every migration-seeded row.
+    let created_by: i64 = sqlx::query_scalar("SELECT created_by FROM accounts WHERE id = ?")
+        .bind(caja)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        created_by, actor,
+        "the seed names the migration's sistema sentinel"
+    );
+
+    // End to end: the pair Caja+Cash passes the migration-44 guard on the
+    // method-choosing table.
+    let customer: i64 = sqlx::query_scalar(
+        "INSERT INTO customers (name, created_by) VALUES ('T6 buyer', ?) RETURNING id",
+    )
+    .bind(actor)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let sale: i64 = sqlx::query_scalar(
+        "INSERT INTO sales (status, payment_type, customer_id, customer_name, sale_date, created_by) \
+         VALUES ('Confirmed', 'Cash', ?, 'T6 buyer', '2024-05-01', ?) RETURNING id",
+    )
+    .bind(customer)
+    .bind(actor)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, created_by) \
+         VALUES (?, ?, ?, '10', '2024-05-01', ?)",
+    )
+    .bind(sale)
+    .bind(caja)
+    .bind(cash)
+    .bind(actor)
+    .execute(&pool)
+    .await
+    .expect("the seeded Caja+Cash pair must pass the migration-44 guard on sale_payments");
+}
+
+/// (b) The schema carries the rule now: an `INSERT` into `payment_methods`
+/// without an account is refused, whatever the caller. Fails today because the
+/// column is still `NULL`able (migration 24's allowance).
+#[tokio::test]
+async fn t6_inserting_a_payment_method_without_an_account_is_refused_by_the_schema() {
+    let pool = pool().await;
+    let actor = sentinel(&pool).await;
+    let err =
+        sqlx::query("INSERT INTO payment_methods (name, created_by) VALUES ('orphan attempt', ?)")
+            .bind(actor)
+            .execute(&pool)
+            .await
+            .unwrap_err();
+    // SQLite's own NOT NULL refusal names the column; the rule lives in the
+    // schema, not in a wrapper's message.
+    assert_eq!(
+        crate::error::db_err_message(&err),
+        "NOT NULL constraint failed: payment_methods.account_id",
+        "the schema refuses a method without an account"
+    );
+}
+
+/// The trigger migration 36 installs on `payment_methods` must survive the
+/// table rebuild: a method row written WITHOUT the stamp carries the current
+/// timestamp, exactly as before. Fails today's shape only after the rebuild
+/// exists (before it, the trigger is still there and the write below passes —
+/// which is why this proof runs against the migrated schema again).
+#[tokio::test]
+async fn t6_payment_methods_trigger_survives_the_rebuild_and_stamps_new_inserts() {
+    let pool = pool().await;
+    let actor = sentinel(&pool).await;
+    let caja: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'Caja'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let method: i64 = sqlx::query_scalar(
+        "INSERT INTO payment_methods (name, account_id, created_by) \
+         VALUES ('T6 stamp', ?, ?) RETURNING id",
+    )
+    .bind(caja)
+    .bind(actor)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let stamped: String = sqlx::query_scalar("SELECT updated_at FROM payment_methods WHERE id = ?")
+        .bind(method)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_ne!(
+        stamped, "1970-01-01T00:00:00.000Z",
+        "the insert-time stamp trigger must be alive after the rebuild"
     );
 }

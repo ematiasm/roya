@@ -40,12 +40,13 @@ use crate::models::PriceRefusal;
 use crate::repositories::{
     SqliteAccountRepository, SqliteBarcodeRepository, SqliteBusinessConfigurationRepository,
     SqliteCategoryRepository, SqliteCustomerReceiptRepository, SqliteCustomerRepository,
-    SqliteCustomerReturnRepository, SqliteDocSequenceRepository, SqlitePaymentMethodRepository,
-    SqliteProductRepository, SqliteProductSupplierCostRepository, SqliteProductTaxRepository,
-    SqlitePurchaseRepository, SqlitePurchaseReturnRepository, SqliteRoleRepository,
-    SqliteSaleRepository, SqliteSessionRepository, SqliteSetupRepository,
-    SqliteStockMovementRepository, SqliteSupplierRepository, SqliteTaxRepository,
-    SqliteTaxSnapshotRepository, SqliteTransactionRepository, SqliteUserRepository,
+    SqliteCustomerReturnRepository, SqliteDocSequenceRepository, SqlitePartyLedgerRepository,
+    SqlitePaymentMethodRepository, SqlitePaymentRepository, SqliteProductRepository,
+    SqliteProductSupplierCostRepository, SqliteProductTaxRepository, SqlitePurchaseRepository,
+    SqlitePurchaseReturnRepository, SqliteRoleRepository, SqliteSaleRepository,
+    SqliteSessionRepository, SqliteSetupRepository, SqliteStockMovementRepository,
+    SqliteSupplierRepository, SqliteTaxRepository, SqliteTaxSnapshotRepository,
+    SqliteTransactionRepository, SqliteUserRepository,
 };
 use crate::routes::setup_web::setup_gate;
 use crate::security::auth_middleware;
@@ -76,6 +77,8 @@ pub type SalesSvc = SalesService<
     SqlitePaymentMethodRepository,
     SqliteCustomerRepository,
     SqliteTaxSnapshotRepository,
+    SqlitePartyLedgerRepository,
+    SqlitePaymentRepository,
 >;
 
 pub type CustomerSvc = CustomerService<SqliteCustomerRepository>;
@@ -105,6 +108,8 @@ pub type ReceiptSvc = CustomerReceiptService<
     SqlitePaymentMethodRepository,
     SqliteCustomerRepository,
     SqliteTaxSnapshotRepository,
+    SqlitePartyLedgerRepository,
+    SqlitePaymentRepository,
 >;
 
 pub type MethodSvc = PaymentMethodService<SqlitePaymentMethodRepository>;
@@ -130,6 +135,8 @@ pub type PurchaseReturnSvc = PurchaseReturnService<
     SqliteStockMovementRepository,
     SqliteAccountRepository,
     SqliteTransactionRepository,
+    SqlitePartyLedgerRepository,
+    SqlitePaymentRepository,
 >;
 
 /// Credit notes (M-purchase returns): the customer sends goods BACK to the
@@ -145,6 +152,8 @@ pub type CustomerReturnSvc = CustomerReturnService<
     SqliteStockMovementRepository,
     SqliteAccountRepository,
     SqliteTransactionRepository,
+    SqlitePartyLedgerRepository,
+    SqlitePaymentRepository,
 >;
 
 pub type PurchasesSvc = PurchasesService<
@@ -160,6 +169,8 @@ pub type PurchasesSvc = PurchasesService<
     SqliteTransactionRepository,
     SqlitePaymentMethodRepository,
     SqliteTaxSnapshotRepository,
+    SqlitePartyLedgerRepository,
+    SqlitePaymentRepository,
 >;
 
 /// The identity service the deny-by-default gate and the login/logout routes
@@ -296,7 +307,11 @@ pub(crate) fn localized_refusal_error(
 #[derive(Clone)]
 pub struct AppState {
     pub pool: SqlitePool,
-    pub account_service: AccountService<SqliteAccountRepository, SqliteTransactionRepository>,
+    pub account_service: AccountService<
+        SqliteAccountRepository,
+        SqliteTransactionRepository,
+        SqlitePaymentMethodRepository,
+    >,
     pub transaction_service:
         TransactionService<SqliteAccountRepository, SqliteTransactionRepository>,
     pub inventory_service: InventorySvc,
@@ -398,7 +413,11 @@ impl AppState {
     ) -> Self {
         let acc_repo = SqliteAccountRepository::new(pool.clone());
         let tx_repo = SqliteTransactionRepository::new(pool.clone());
-        let account_service = AccountService::new(acc_repo.clone(), tx_repo.clone());
+        let account_service = AccountService::new(
+            acc_repo.clone(),
+            tx_repo.clone(),
+            SqlitePaymentMethodRepository::new(pool.clone()),
+        );
         let transaction_service =
             TransactionService::new(acc_repo.clone(), tx_repo.clone(), allow_negative);
         let inventory_service = InventoryService::new(
@@ -425,6 +444,10 @@ impl AppState {
             customer_service.clone(),
             SqliteTaxSnapshotRepository::new(pool.clone()),
             enforce_credit_limit,
+            // T2: the customer journal `confirm` appends to, over the same pool.
+            SqlitePartyLedgerRepository::new(pool.clone()),
+            // P3: the delivery-of-money document `record_payment` writes.
+            SqlitePaymentRepository::new(pool.clone()),
         );
         // M4: collections group the payments one handover of money produced; the
         // receipt service composes the same sales service and the finance-owned
@@ -449,6 +472,10 @@ impl AppState {
             transaction_service.clone(),
             PaymentMethodService::new(method_repo),
             SqliteTaxSnapshotRepository::new(pool.clone()),
+            // T2: the supplier journal `confirm` appends to, over the same pool.
+            SqlitePartyLedgerRepository::new(pool.clone()),
+            // T3d: the refund deliveries a cancellation writes.
+            SqlitePaymentRepository::new(pool.clone()),
         );
         // M-purchase returns. THE FLAGS ARE THE PARENT'S, and deliberately so:
         // both return services take the SAME `inventory_service` and
@@ -493,6 +520,10 @@ impl AppState {
             SqlitePurchaseRepository::new(pool.clone()),
             inventory_service.clone(),
             transaction_service.clone(),
+            // T2: the supplier journal a confirmed purchase return appends to.
+            SqlitePartyLedgerRepository::new(pool.clone()),
+            // T3d: the reversal deliveries `cancel` writes.
+            SqlitePaymentRepository::new(pool.clone()),
         );
         let customer_return_service = CustomerReturnService::new(
             SqliteCustomerReturnRepository::new(pool.clone()),
@@ -500,6 +531,10 @@ impl AppState {
             SqliteSaleRepository::new(pool.clone()),
             inventory_service.clone(),
             transaction_service.clone(),
+            // T2: the customer journal a confirmed credit note appends to.
+            SqlitePartyLedgerRepository::new(pool.clone()),
+            // T3d: the reversal deliveries `cancel` writes.
+            SqlitePaymentRepository::new(pool.clone()),
         );
         // The documents index composes the four families' read paths; it holds
         // only reads, so wiring it never moves write ownership.

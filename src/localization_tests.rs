@@ -302,11 +302,11 @@ fn seeded_display_mappings_are_bilingual_and_preserve_custom_fallbacks() {
         "Bank transfer"
     );
     assert_eq!(
-        spanish.payment_method_label("Cash", None),
-        "Efectivo — sin asignar"
+        spanish.payment_method_label("Cash", "Caja"),
+        "Efectivo — Caja"
     );
     assert_eq!(
-        english.payment_method_label("Custom wallet", Some("Treasury")),
+        english.payment_method_label("Custom wallet", "Treasury"),
         "Custom wallet — Treasury"
     );
     assert_eq!(

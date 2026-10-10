@@ -30,23 +30,12 @@
     <div class="flex flex-wrap gap-x-5 gap-y-2">
       {% for m in methods %}
       <label class="choice">
-        <input type="checkbox" name="method_ids" value="{{ m.id }}" checked />
+        <input type="checkbox" name="method_ids" value="{{ m.id }}" {% if m.is_active %}checked{% endif %} />
         {{ localization.payment_method_display_name(m.name.as_str()) }}{% if !m.is_active %} <span class="text-muted">{{ localization.tr(crate::localization::MessageKey::CommonInactiveLabel) }}</span>{% endif %}
       </label>
       {% endfor %}
     </div>
-    {% if !unassigned.is_empty() %}
-    <div class="text-[13px] font-bold text-muted">{{ localization.tr(crate::localization::MessageKey::AccountUnassignedMethods) }}</div>
-    <div class="flex flex-wrap gap-x-5 gap-y-2">
-      {% for m in unassigned %}
-      <label class="choice">
-        <input type="checkbox" name="method_ids" value="{{ m.id }}" />
-        {{ localization.payment_method_display_name(m.name.as_str()) }}{% if !m.is_active %} <span class="text-muted">{{ localization.tr(crate::localization::MessageKey::CommonInactiveLabel) }}</span>{% endif %}
-      </label>
-      {% endfor %}
-    </div>
-    {% endif %}
-    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::AccountSaveHelp) }} {{ localization.tr(crate::localization::MessageKey::AccountUnassignedMethodsHelp) }}</div>
+    <div class="text-[13px] text-muted">{{ localization.tr(crate::localization::MessageKey::AccountSaveHelp) }}</div>
     <button type="submit" class="btn-primary self-start">{{ localization.tr(crate::localization::MessageKey::AccountSaveMethods) }}</button>
   </form>
 </div>

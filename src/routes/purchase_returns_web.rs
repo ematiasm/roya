@@ -61,7 +61,7 @@ use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
 use crate::models::{PurchaseReturn, PurchaseReturnStatus};
 use crate::repositories::purchase_return_repo::PurchaseReturnListFilter;
-use crate::repositories::PurchaseReturnRepository;
+use crate::repositories::{PaymentRepository, PurchaseReturnRepository};
 use crate::routes::{localized_refusal_error, AppState};
 use crate::security::authz::{Nav, PurchasesCancel, PurchasesCreate, PurchasesRead, Require};
 
@@ -237,9 +237,12 @@ pub struct ReturnRecordContext {
     /// when reconciling. Read from the parent record the wiring layer already
     /// holds, so it costs no extra read.
     pub parent_number: String,
-    /// The refunds, resolved to display names. Derived from `detail.payments` by
-    /// the wiring layer, which is the one layer allowed to reach the accounts and
-    /// payment methods (AC20's sibling rule).
+    /// The refunds, resolved to display names. Built from the JOURNAL's refund
+    /// deliveries for this return by the wiring layer, which is the one layer
+    /// allowed to reach the accounts and payment methods (AC20's sibling rule).
+    /// The read is the tolerant form: an entry legacy history left unresolvable
+    /// (the T1 backfill stamps the document number) is logged rather than turned
+    /// into a page failure, so the rows shown are the ones that could be resolved.
     pub refunds: Vec<RefundRow>,
     /// The parent purchase's own lines, each with its allowance resolved — the
     /// line editor's rows. Empty for a document whose parent cannot be read,
@@ -673,7 +676,22 @@ async fn record_context(
     // one call covers the payment table; a payment whose method or account is no
     // longer in that catalogue degrades to its id rather than failing the page.
     let methods = state.payment_method_service.methods_with_accounts().await?;
-    let refunds = detail
+    let deliveries = state
+        .purchase_return_service
+        .payments
+        .list_refunds_for_document_tolerant(
+            crate::models::PartyDocumentKind::PurchaseReturn,
+            detail.purchase_return.id,
+        )
+        .await?;
+    if deliveries.unresolved_entries > 0 {
+        tracing::warn!(
+            document_id = detail.purchase_return.id,
+            unresolved_entries = deliveries.unresolved_entries,
+            "some refund journal entries could not be resolved for the purchase return page"
+        );
+    }
+    let refunds = deliveries
         .payments
         .iter()
         .map(|payment| {
@@ -682,7 +700,7 @@ async fn record_context(
                 id: payment.id,
                 date: payment.date,
                 account_name: method
-                    .and_then(|m| m.account_name.clone())
+                    .map(|m| m.account_name.clone())
                     .unwrap_or_else(|| payment.account_id.to_string()),
                 method_name: method.map(|m| m.name.clone()).unwrap_or_default(),
                 amount: payment.amount,
@@ -980,8 +998,8 @@ async fn web_confirm_purchase_return(
     // `form_or_refusal`.
     let _form = form_or_refusal(form, &localization)?;
     // **No method field.** `confirm` resolves the refunds PER ORIGINATING
-    // ACCOUNT from the parent's payment rows, and `purchase_return_payments` has
-    // no `payment_type` column (decision 7): a return's refunds are determined
+    // ACCOUNT from the parent's payment rows, and the refund row this route used to
+    // keep had no `payment_type` column (decision 7): a return's refunds are determined
     // entirely by the parent's payments, so storing or posting a second copy of
     // that flag would be a value that could disagree with the rows it summarizes.
     state
@@ -1396,7 +1414,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|m| m.name == "Cash" && m.account_id == Some(account.id))
+            .find(|m| m.name == "Cash" && m.account_id == account.id)
             .expect("the default Cash method is now bound to the wallet account");
         // Fund it, so a credit-note reversal or a spend-refusal has a real
         // balance to argue about rather than a zero.

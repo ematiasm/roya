@@ -561,38 +561,55 @@ mod tests {
         assert_eq!(st, StatusCode::CREATED, "seed stock: {v}");
     }
 
+    /// Find-or-create by name. Migration 45 seeds an account named `Caja`, and
+    /// these fixtures must not fail on `resource already exists` when a test
+    /// happens to ask for that name: the account the test wants is the seeded
+    /// one, and creating a second is neither possible nor intended.
     async fn seed_account(app: &axum::Router, name: &str) -> i64 {
-        let (st, v) = post(app, "/api/accounts", json!({ "name": name })).await;
-        assert_eq!(st, StatusCode::CREATED, "seed account {name}: {v}");
-        v["id"].as_i64().unwrap()
+        let (status, v) = post(app, "/api/accounts", json!({ "name": name })).await;
+        if status == StatusCode::CREATED {
+            return v["id"].as_i64().unwrap();
+        }
+        assert_eq!(status, StatusCode::CONFLICT, "seed account {name}: {v}");
+        let (_, list) = get(app, "/api/accounts").await;
+        list["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == json!(name))
+            .unwrap_or_else(|| panic!("account {name} exists but is not listed: {list}"))["id"]
+            .as_i64()
+            .unwrap()
     }
 
+    /// The account's own `Cash`: reused when it already has one (the idempotence
+    /// the fixture needs when a test calls this twice), otherwise created from the
+    /// seeded row's name. Migration 45 makes the port that used to "assign the
+    /// unassigned Cash" impossible, and `UNIQUE(account_id, name)` makes a blind
+    /// duplicate a hard error — so the lookup comes first.
     async fn allow_cash(pool: &SqlitePool, account_id: i64) -> i64 {
-        let (cash,): (i64,) = sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
-            .fetch_one(pool)
-            .await
-            .unwrap();
-        // Ownership, not an allowlist: assign the unassigned Cash, or duplicate
-        // the name when it is already owned elsewhere in this pool.
-        let assigned = sqlx::query(
-            "UPDATE payment_methods SET account_id = ? WHERE id = ? AND account_id IS NULL",
+        if let Some(existing) = sqlx::query_scalar::<_, i64>(
+            "SELECT id FROM payment_methods WHERE account_id = ? AND name = 'Cash'",
         )
         .bind(account_id)
-        .bind(cash)
-        .execute(pool)
+        .fetch_optional(pool)
         .await
         .unwrap()
-        .rows_affected();
-        if assigned == 1 {
-            return cash;
+        {
+            return existing;
         }
+        let (seeded,): (i64,) =
+            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
+                .fetch_one(pool)
+                .await
+                .unwrap();
         let row: (i64,) = sqlx::query_as(
             "INSERT INTO payment_methods (name, account_id, is_active, created_by) \
              SELECT name, ?, is_active, ? FROM payment_methods WHERE id = ? RETURNING id",
         )
         .bind(account_id)
         .bind(test_support::audit_actor_id(pool).await.unwrap())
-        .bind(cash)
+        .bind(seeded)
         .fetch_one(pool)
         .await
         .unwrap();
@@ -1009,7 +1026,8 @@ mod tests {
         assert_eq!(st, StatusCode::OK, "{v}");
         assert_eq!(dec(&v["balance"]), dec(&json!("20")));
 
-        // The statement now mixes the sale debits with the payment credit.
+        // The statement has one credit row per delivery document (not one per
+        // allocation): the single 60 collection covers two sales but remains one journal row.
         let (st, v) = get(
             &app,
             &format!("/api/customers/{customer}/statement?as_of=2024-07-20"),
@@ -1019,8 +1037,8 @@ mod tests {
         let entries = v["statement"]["entries"].as_array().unwrap();
         assert_eq!(
             entries.len(),
-            4,
-            "two sale debits plus two allocation credits: {entries:?}"
+            3,
+            "two sale debits plus one delivery credit: {entries:?}"
         );
         let credits: Decimal = entries
             .iter()
@@ -1043,7 +1061,10 @@ mod tests {
         let customer = seed_customer(&app, "Rechazos", None, None).await;
         credit_sale(&app, customer, product, "3", "2024-06-01").await; // 30
 
-        // Over the outstanding debt.
+        // **Over the outstanding debt is no longer a rejection (P3c): it is a credit.**
+        // The REST contract changed here, and the three figures below ARE the change:
+        // `total` is what came in, `applied` is what found a document, and `unapplied`
+        // is the credit. Before this, the request was a 400 and nothing was written.
         let (st, v) = post(
             &app,
             "/api/customer-receipts",
@@ -1053,15 +1074,16 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "over-collect: {v}");
-        assert!(
-            v["error"].as_str().unwrap_or_default().contains("30"),
-            "the outstanding figure must be quoted: {v}"
-        );
-        assert_eq!(receipt_count(&pool).await, 0);
+        assert_eq!(st, StatusCode::CREATED, "over-collect is a credit now: {v}");
+        assert_eq!(v["total"], json!("31"), "what was handed over: {v}");
+        assert_eq!(v["applied"], json!("30"), "what found a document: {v}");
+        assert_eq!(v["unapplied"], json!("1"), "and the credit: {v}");
+        assert_eq!(receipt_count(&pool).await, 1);
 
-        // Unassigned method: no account can be derived, so it is a 400.
-        sqlx::query("UPDATE payment_methods SET account_id = NULL WHERE id = ?")
+        // Inactive method: `account_id` is NOT NULL since migration 45, so the
+        // unusable state is the deactivated one — the same refusal an operator
+        // gets after unticking a method in the account editor.
+        sqlx::query("UPDATE payment_methods SET is_active = 0 WHERE id = ?")
             .bind(cash)
             .execute(&pool)
             .await
@@ -1075,15 +1097,18 @@ mod tests {
             }),
         )
         .await;
-        assert_eq!(st, StatusCode::BAD_REQUEST, "unassigned method: {v}");
+        assert_eq!(st, StatusCode::BAD_REQUEST, "inactive method: {v}");
         assert!(
             v["error"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("not assigned"),
-            "the message must name the fix: {v}"
+                .contains("is inactive"),
+            "the message must name the state: {v}"
         );
-        assert_eq!(receipt_count(&pool).await, 0);
+        // One receipt exists: the over-collection above was ACCEPTED (P3c) and created
+        // one. The inactive-method rejection below must add none, which is what the
+        // count checks after it.
+        assert_eq!(receipt_count(&pool).await, 1);
 
         // Unknown customer is a 404 before any write; unknown method too.
         let (st, _) = post(
@@ -1106,7 +1131,9 @@ mod tests {
         )
         .await;
         assert_eq!(st, StatusCode::NOT_FOUND);
-        assert_eq!(receipt_count(&pool).await, 0);
+        // Still the ONE receipt from the accepted over-collection: an unknown method and
+        // an unknown customer are both refused before any write.
+        assert_eq!(receipt_count(&pool).await, 1);
 
         // A list without customer_id is a 400, not an unbounded dump.
         let (st, v) = get(&app, "/api/customer-receipts").await;
@@ -1116,9 +1143,14 @@ mod tests {
             StatusCode::NOT_FOUND
         );
 
-        // The receivable is untouched by every rejection.
+        // The residual is zero and the unapplied 1 is customer credit, so the
+        // signed balance is -1; the rejected requests below it added nothing.
         let (_, v) = get(&app, &format!("/api/customers/{customer}")).await;
-        assert_eq!(dec(&v["balance"]), dec(&json!("30")));
+        assert_eq!(
+            dec(&v["balance"]),
+            dec(&json!("-1")),
+            "the 30 residual is settled and the unapplied 1 is subtracted from the balance"
+        );
     }
 
     // -- The interface never offers a caller-supplied receipt id ----------------

@@ -5,9 +5,7 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqliteConnection, SqlitePool};
 use std::str::FromStr;
 
 use crate::error::{AppError, AppResult};
-use crate::models::{
-    PurchaseReturn, PurchaseReturnLine, PurchaseReturnPayment, PurchaseReturnStatus,
-};
+use crate::models::{PurchaseReturn, PurchaseReturnLine, PurchaseReturnStatus};
 
 /// A `%…%` LIKE needle whose literal `%`, `_` and `\` are escaped, so the SQL
 /// matches the same partial substring every other list in this layer matches.
@@ -102,26 +100,6 @@ fn row_to_line(row: sqlx::sqlite::SqliteRow) -> PurchaseReturnLine {
         qty: parse_decimal(&qty_str),
         unit_cost: parse_decimal(&cost_str),
         created_at: row.get("created_at"),
-    }
-}
-
-fn row_to_payment(row: sqlx::sqlite::SqliteRow) -> PurchaseReturnPayment {
-    let amt_str: String = row.get("amount");
-    let created_at = row.get("created_at");
-    let updated_at = row.try_get("updated_at").unwrap_or(created_at);
-    PurchaseReturnPayment {
-        id: row.get("id"),
-        return_id: row.get("return_id"),
-        account_id: row.get("account_id"),
-        method_id: row.get("method_id"),
-        amount: parse_decimal(&amt_str),
-        date: row.get("date"),
-        transaction_id: row.get("transaction_id"),
-        refund_transaction_id: row.get("refund_transaction_id"),
-        created_by: row.get("created_by"),
-        updated_by: row.get("updated_by"),
-        created_at,
-        updated_at,
     }
 }
 
@@ -318,6 +296,14 @@ pub trait PurchaseReturnRepository: Send + Sync {
         actor: i64,
         reason: Option<&str>,
     ) -> AppResult<PurchaseReturn>;
+    /// The `_in` twin, for the same reason (T3d).
+    async fn set_cancelled_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+        actor: i64,
+        reason: Option<&str>,
+    ) -> AppResult<PurchaseReturn>;
 
     /// Delete a DRAFT purchase return — or a DISCARDED one (Cancelled while
     /// never confirmed: `return_number IS NULL`) — and let its lines die by
@@ -365,61 +351,6 @@ pub trait PurchaseReturnRepository: Send + Sync {
     /// Remove a DRAFT return line. Statement-level DRAFT predicate, `NotFound`
     /// for a missing line, `Conflict` for one whose return is no longer a Draft.
     async fn delete_line(&self, id: i64) -> AppResult<()>;
-
-    /// Create the refund row and link it to the finance transaction it produced
-    /// (`transaction_id`); NULL only for historical rows. The refund carries the
-    /// acting user of the request that produced it.
-    ///
-    /// It has NO state gate, and that is deliberate: a refund may be recorded
-    /// against a return that is ALREADY CONFIRMED, exactly as
-    /// `record_payment` collects against a confirmed purchase. A `Draft`
-    /// predicate here would refuse a real collection. The control on the
-    /// confirm-time residue window is the ORDERING — `confirm` reaches this
-    /// write and then ends in `set_confirmed` — not a predicate on the insert.
-    async fn create_payment(
-        &self,
-        actor: i64,
-        return_id: i64,
-        account_id: i64,
-        method_id: i64,
-        amount: Decimal,
-        date: NaiveDate,
-        transaction_id: Option<i64>,
-    ) -> AppResult<PurchaseReturnPayment>;
-
-    /// [`Self::create_payment`] inside a transaction the CALLER owns, and the
-    /// reason this write belongs to the confirm unit is the same one that made
-    /// `purchase_payments` the hinge of its old residue: this is the row the
-    /// paid/unpaid state of the document is derived from, and it is written
-    /// against the `Income` it records.
-    ///
-    /// Unlike `set_confirmed_in` this write has no read-back and no refusal
-    /// helper, which makes it the straight case: the statement moves to the
-    /// caller's executor and `map_db_err` moves with it, unchanged.
-    async fn create_payment_in(
-        &self,
-        tx: &mut sqlx::SqliteConnection,
-        actor: i64,
-        return_id: i64,
-        account_id: i64,
-        method_id: i64,
-        amount: Decimal,
-        date: NaiveDate,
-        transaction_id: Option<i64>,
-    ) -> AppResult<PurchaseReturnPayment>;
-
-    /// Link the refund transaction created by cancelling or reversing THIS
-    /// RETURN to the payment row it refunds. The original `transaction_id` is
-    /// left untouched, so a refund that has itself been reversed ends up carrying
-    /// BOTH links.
-    async fn set_payment_refund_transaction(
-        &self,
-        actor: i64,
-        payment_id: i64,
-        refund_transaction_id: i64,
-    ) -> AppResult<PurchaseReturnPayment>;
-
-    async fn list_payments(&self, return_id: i64) -> AppResult<Vec<PurchaseReturnPayment>>;
 }
 
 #[derive(Clone)]
@@ -738,6 +669,19 @@ impl PurchaseReturnRepository for SqlitePurchaseReturnRepository {
         actor: i64,
         reason: Option<&str>,
     ) -> AppResult<PurchaseReturn> {
+        let mut tx = self.pool.begin().await?;
+        let cancelled = self.set_cancelled_in(&mut tx, id, actor, reason).await?;
+        tx.commit().await?;
+        Ok(cancelled)
+    }
+
+    async fn set_cancelled_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+        actor: i64,
+        reason: Option<&str>,
+    ) -> AppResult<PurchaseReturn> {
         let clean = reason.and_then(|s| {
             let t = s.trim();
             if t.is_empty() {
@@ -758,7 +702,7 @@ impl PurchaseReturnRepository for SqlitePurchaseReturnRepository {
         .bind(clean)
         .bind(actor)
         .bind(id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_return(row))
@@ -946,99 +890,6 @@ impl PurchaseReturnRepository for SqlitePurchaseReturnRepository {
         tx.commit().await?;
         Ok(())
     }
-
-    async fn create_payment(
-        &self,
-        actor: i64,
-        return_id: i64,
-        account_id: i64,
-        method_id: i64,
-        amount: Decimal,
-        date: NaiveDate,
-        transaction_id: Option<i64>,
-    ) -> AppResult<PurchaseReturnPayment> {
-        let mut tx = self.pool.begin().await?;
-        let payment = self
-            .create_payment_in(
-                &mut tx,
-                actor,
-                return_id,
-                account_id,
-                method_id,
-                amount,
-                date,
-                transaction_id,
-            )
-            .await?;
-        tx.commit().await?;
-        Ok(payment)
-    }
-
-    async fn create_payment_in(
-        &self,
-        tx: &mut SqliteConnection,
-        actor: i64,
-        return_id: i64,
-        account_id: i64,
-        method_id: i64,
-        amount: Decimal,
-        date: NaiveDate,
-        transaction_id: Option<i64>,
-    ) -> AppResult<PurchaseReturnPayment> {
-        // No state predicate, for the reason on the trait method: a refund may be
-        // recorded against a Confirmed return. `RETURNING` answers the row this
-        // INSERT wrote, inside the caller's unit, so the id is not a guess.
-        let row = sqlx::query(
-            r#"INSERT INTO purchase_return_payments (return_id, account_id, method_id, amount, date, transaction_id, created_by)
-               VALUES (?, ?, ?, ?, ?, ?, ?)
-               RETURNING id, return_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at, updated_at"#,
-        )
-        .bind(return_id)
-        .bind(account_id)
-        .bind(method_id)
-        .bind(amount.to_string())
-        .bind(date)
-        .bind(transaction_id)
-        .bind(actor)
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(map_db_err)?;
-        Ok(row_to_payment(row))
-    }
-
-    async fn set_payment_refund_transaction(
-        &self,
-        actor: i64,
-        payment_id: i64,
-        refund_transaction_id: i64,
-    ) -> AppResult<PurchaseReturnPayment> {
-        // Only the reversal link moves; `transaction_id` is left exactly as the
-        // refund recorded it, which is what lets one row carry both.
-        let row = sqlx::query(
-            r#"UPDATE purchase_return_payments
-               SET refund_transaction_id = ?, updated_by = ?,
-                   updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-               WHERE id = ?
-               RETURNING id, return_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at, updated_at"#,
-        )
-        .bind(refund_transaction_id)
-        .bind(actor)
-        .bind(payment_id)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(map_db_err)?;
-        Ok(row_to_payment(row))
-    }
-
-    async fn list_payments(&self, return_id: i64) -> AppResult<Vec<PurchaseReturnPayment>> {
-        let rows = sqlx::query(
-            r#"SELECT id, return_id, account_id, method_id, amount, date, transaction_id, refund_transaction_id, created_by, updated_by, created_at, updated_at FROM purchase_return_payments WHERE return_id = ? ORDER BY id"#,
-        )
-        .bind(return_id)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_payment).collect())
-    }
 }
 
 #[cfg(test)]
@@ -1049,6 +900,61 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
     use std::time::{Duration, Instant};
+
+    // -- migration 44: the (account_id, method_id) pair on a purchase-return
+    // refund is guarded by the schema. The refusals are proved with the raw
+    // statement and the trigger's own text; the full battery lives on
+    // sale_payments.
+
+    async fn owned_pair(pool: &SqlitePool, name: &str) -> (i64, i64) {
+        let actor = test_support::audit_actor_id(pool).await.unwrap();
+        let account: i64 = match sqlx::query_scalar("SELECT id FROM accounts WHERE name = ?")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO accounts (name, created_by) VALUES (?, ?) RETURNING id",
+            )
+            .bind(name)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
+        let method_name = format!("{name} cash");
+        let method: i64 = match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = ? AND account_id = ?",
+        )
+        .bind(&method_name)
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by) VALUES (?, ?, ?) RETURNING id",
+            )
+            .bind(&method_name)
+            .bind(account)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
+        (account, method)
+    }
+
+    // The migration 44 exemption for a replayed (account, method) pair no
+    // longer needs a pin HERE: the pair does not live in a return-payment row
+    // any more. A refund IS a `payments` delivery, exempt by (party, direction)
+    // in migration 48, and the pin that proves it runs through the real confirm
+    // path — `a_refund_replays_the_parent_payments_account_even_after_the_method_is_repointed`
+    // in `services::{customer_return,purchase_return}`. Migration 49 dropped this
+    // table, so a test here would pin a shape nothing writes.
 
     async fn memory_pool() -> SqlitePool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -1187,11 +1093,27 @@ mod tests {
                 .await
                 .unwrap(),
             };
-        let (method,): (i64,) =
-            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        // Migration 44 guards the (account, method) pair on the payment row,
+        // so the fixture needs a method THIS wallet owns (the seeded methods
+        // are unassigned on a fresh database).
+        let method: i64 = match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = 'doc wallet cash' AND account_id = ?",
+        )
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by)\n                 VALUES ('doc wallet cash', ?, ?) RETURNING id",
+            )
+            .bind(account)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
         (account, method)
     }
 
@@ -1255,21 +1177,6 @@ mod tests {
         assert_eq!(actual.qty, expected.qty);
         assert_eq!(actual.unit_cost, expected.unit_cost);
         assert_eq!(actual.created_at, expected.created_at);
-    }
-
-    fn assert_same_payment(actual: &PurchaseReturnPayment, expected: &PurchaseReturnPayment) {
-        assert_eq!(actual.id, expected.id);
-        assert_eq!(actual.return_id, expected.return_id);
-        assert_eq!(actual.account_id, expected.account_id);
-        assert_eq!(actual.method_id, expected.method_id);
-        assert_eq!(actual.amount, expected.amount);
-        assert_eq!(actual.date, expected.date);
-        assert_eq!(actual.transaction_id, expected.transaction_id);
-        assert_eq!(actual.refund_transaction_id, expected.refund_transaction_id);
-        assert_eq!(actual.created_by, expected.created_by);
-        assert_eq!(actual.updated_by, expected.updated_by);
-        assert_eq!(actual.created_at, expected.created_at);
-        assert_eq!(actual.updated_at, expected.updated_at);
     }
 
     /// A return is born a Draft with NO number, and every column comes back
@@ -1724,82 +1631,6 @@ mod tests {
         );
     }
 
-    /// A refund row round-trips, lists, and takes a reversal link WITHOUT
-    /// disturbing the link it already carried — the same shape as
-    /// `purchase_payments`, because a return that was itself reversed has BOTH.
-    #[tokio::test]
-    async fn return_payments_create_list_and_link_a_refund_without_disturbing_the_original_link() {
-        let pool = memory_pool().await;
-        let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let repo = SqlitePurchaseReturnRepository::new(pool.clone());
-        let (supplier, purchase, _line) =
-            seed_parent(&pool, "Paying Supplier", d(2024, 5, 2), actor).await;
-        let ret =
-            seed_return_with_status(&pool, "Draft", supplier, purchase, d(2024, 6, 1), actor).await;
-        let (account, method) = account_and_method(&pool, actor).await;
-        let income = transaction_id(&pool, account, "Income", "42.50", d(2024, 6, 1), actor).await;
-
-        let payment = repo
-            .create_payment(
-                actor,
-                ret,
-                account,
-                method,
-                dec("42.50"),
-                d(2024, 6, 1),
-                Some(income),
-            )
-            .await
-            .unwrap();
-        assert_eq!(payment.return_id, ret);
-        assert_eq!(payment.account_id, account);
-        assert_eq!(payment.method_id, method);
-        assert_eq!(payment.amount, dec("42.50"));
-        assert_eq!(payment.date, d(2024, 6, 1));
-        assert_eq!(payment.transaction_id, Some(income));
-        assert_eq!(payment.refund_transaction_id, None);
-        assert_eq!(payment.created_by, actor);
-        assert_eq!(payment.updated_by, None);
-        let listed = repo.list_payments(ret).await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_same_payment(&listed[0], &payment);
-
-        let reversal =
-            transaction_id(&pool, account, "Expense", "42.50", d(2024, 6, 5), actor).await;
-        let linked = repo
-            .set_payment_refund_transaction(actor, payment.id, reversal)
-            .await
-            .unwrap();
-        assert_eq!(linked.refund_transaction_id, Some(reversal));
-        assert_eq!(
-            linked.transaction_id,
-            Some(income),
-            "the original link is left untouched"
-        );
-        assert_eq!(linked.updated_by, Some(actor));
-        assert!(
-            linked.updated_at >= payment.updated_at,
-            "stamping updated_at cannot move it backwards"
-        );
-        assert_eq!(repo.list_payments(ret).await.unwrap().len(), 1);
-
-        // A second refund is a second row, not an overwrite.
-        let second = repo
-            .create_payment(
-                actor,
-                ret,
-                account,
-                method,
-                dec("7.50"),
-                d(2024, 6, 1),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_ne!(second.id, payment.id);
-        assert_eq!(repo.list_payments(ret).await.unwrap().len(), 2);
-    }
-
     // -- Phase A: the transaction-joining forms ------------------------------
 
     /// The confirm write is the one that MATTERS, because it is the statement
@@ -2003,186 +1834,28 @@ mod tests {
         );
     }
 
-    /// The write must land in the caller's unit, not in one of its own: a
-    /// payment created inside a transaction and rolled back with it is GONE, and
-    /// one that escaped into a private unit would be visible to the pool the
-    /// moment it committed.
-    ///
-    /// A single-connection pool is what makes that visible instead of merely
-    /// likely: there is no spare connection for a nested `begin()` to take.
-    #[tokio::test]
-    async fn create_payment_in_writes_into_the_callers_transaction_and_a_rollback_takes_it_away() {
-        let pool = memory_pool().await;
-        let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let repo = SqlitePurchaseReturnRepository::new(pool.clone());
-        let (supplier, purchase, _line) =
-            seed_parent(&pool, "In-Tx Supplier", d(2024, 5, 2), actor).await;
-        let ret =
-            seed_return_with_status(&pool, "Draft", supplier, purchase, d(2024, 6, 1), actor).await;
-        // The account and the method are looked up BEFORE the unit opens: they
-        // are fixture reads, and the pool is the only thing that can answer them.
-        let (account, method) = account_and_method(&pool, actor).await;
-        assert_eq!(
-            count(
-                &pool,
-                "SELECT COUNT(*) FROM purchase_return_payments WHERE return_id = ?",
-                ret
-            )
-            .await,
-            0,
-            "the fixture must start with no payments, or this test proves nothing"
-        );
-
-        let mut tx = pool.begin().await.unwrap();
-        let payment = repo
-            .create_payment_in(
-                &mut tx,
-                actor,
-                ret,
-                account,
-                method,
-                dec("10"),
-                d(2024, 6, 1),
-                None,
-            )
-            .await
-            .expect("create_payment_in could not run while it held the caller's connection");
-        // The RETURNING projection is the row the INSERT wrote, read inside the
-        // same unit, so a payment that answered from a private connection would
-        // have had to guess this id.
-        assert_eq!(payment.return_id, ret);
-        assert_eq!(payment.account_id, account);
-        assert_eq!(payment.method_id, method);
-        assert_eq!(payment.amount, dec("10"));
-        assert_eq!(payment.transaction_id, None);
-        assert_eq!(payment.refund_transaction_id, None);
-        tx.rollback().await.unwrap();
-
-        // Every assertion that touches the pool is AFTER the rollback, and it
-        // says the row is not there. This is the assertion that fails if the
-        // `_in` form committed a unit of its own.
-        assert_eq!(
-            count(
-                &pool,
-                "SELECT COUNT(*) FROM purchase_return_payments WHERE return_id = ?",
-                ret
-            )
-            .await,
-            0,
-            "the payment survived a rollback of the transaction that created it, so create_payment_in opened and committed a unit of its own"
-        );
-        assert!(
-            repo.list_payments(ret).await.unwrap().is_empty(),
-            "list_payments still sees a payment the caller's rollback removed"
-        );
-        // And the unit left no residue on the document it named.
-        let after = repo.find_return(ret).await.unwrap().unwrap();
-        assert_eq!(after.status, PurchaseReturnStatus::Draft);
-    }
-
-    /// `create_payment_in` must not reach for the pool AT ALL, and the assertion
-    /// is the pairing itself rather than a stopwatch. See
-    /// `set_confirmed_in_answers_while_the_callers_transaction_holds_the_only_connection`
-    /// for the argument; this is the straight case, with no read-back to run.
-    #[tokio::test]
-    async fn create_payment_in_answers_while_the_callers_transaction_holds_the_only_connection() {
-        let pool = memory_pool().await;
-        let actor = test_support::audit_actor_id(&pool).await.unwrap();
-        let repo = SqlitePurchaseReturnRepository::new(pool.clone());
-        let (supplier, purchase, _line) =
-            seed_parent(&pool, "Held-Conn Supplier", d(2024, 5, 3), actor).await;
-        let ret =
-            seed_return_with_status(&pool, "Draft", supplier, purchase, d(2024, 6, 2), actor).await;
-        let (account, method) = account_and_method(&pool, actor).await;
-
-        let mut tx = pool.begin().await.unwrap();
-        // The premise, asserted rather than assumed.
-        assert!(
-            pool.try_acquire().is_none(),
-            "the pool still has a spare connection, so this test would not prove anything"
-        );
-
-        let started = Instant::now();
-        let payment = repo
-            .create_payment_in(
-                &mut tx,
-                actor,
-                ret,
-                account,
-                method,
-                dec("25"),
-                d(2024, 6, 2),
-                None,
-            )
-            .await;
-        let elapsed = started.elapsed();
-        let payment = payment.expect(
-            "create_payment_in reached for the pool; with the only connection held by the caller's transaction that is a 30s PoolTimedOut, not an answer",
-        );
-
-        assert_eq!(payment.amount, dec("25"));
-        // MEASURED, not assumed: the pairing above already decides it, and this
-        // bound is the corroboration.
-        assert!(
-            elapsed < Duration::from_secs(5),
-            "create_payment_in took {elapsed:?}; that is a write stalling for a connection, not one on the connection it was handed"
-        );
-        // The caller's transaction is still ALIVE and still holds its lock: a
-        // second write on the same connection answers.
-        let second = repo
-            .create_payment_in(
-                &mut tx,
-                actor,
-                ret,
-                account,
-                method,
-                dec("5"),
-                d(2024, 6, 2),
-                None,
-            )
-            .await
-            .expect("a second write on the same connection could not run");
-        assert_ne!(second.id, payment.id, "both writes returned the same row");
-        tx.rollback().await.unwrap();
-
-        // The pool is answerable again now that the unit is over, so the premise
-        // above was the transaction and not the connection.
-        assert_eq!(
-            count(
-                &pool,
-                "SELECT COUNT(*) FROM purchase_return_payments WHERE return_id = ?",
-                ret
-            )
-            .await,
-            0
-        );
-        assert!(repo
-            .create_payment(actor, ret, account, method, dec("7"), d(2024, 6, 2), None)
-            .await
-            .is_ok());
-    }
-
-    /// The additive claim, proved rather than asserted: both public wrappers
-    /// still answer exactly what they always answered, in every direction — the
-    /// success path, the duplicate-submission refusal, the frozen-document
-    /// refusal, the missing-document refusal and the payment write.
+    /// `set_confirmed` is the public twin, and it still has to answer exactly what
+    /// it always answered: the success path, the duplicate submission, a frozen
+    /// document and a document that does not exist.
     ///
     /// The error VARIANTS matter as much as the messages: `refuse_confirm` maps
     /// "no such document" to `NotFound` and "exists but frozen" to `Validation`,
     /// and a rewrite that collapsed them would still refuse — in a way the HTTP
     /// layer maps to a different status.
+    ///
+    /// The payment half of the wrapper surface is gone with the legacy table, so
+    /// only the confirm contract is exercised here.
     #[tokio::test]
-    async fn the_public_wrappers_answer_exactly_as_before_including_every_refusal() {
+    async fn set_confirmed_answers_the_success_path_and_every_refusal() {
         let pool = memory_pool().await;
         let actor = test_support::audit_actor_id(&pool).await.unwrap();
         let repo = SqlitePurchaseReturnRepository::new(pool.clone());
         let (supplier, purchase, _line) =
             seed_parent(&pool, "Public Supplier", d(2024, 5, 7), actor).await;
-        let (account, method) = account_and_method(&pool, actor).await;
         let draft =
             seed_return_with_status(&pool, "Draft", supplier, purchase, d(2024, 6, 1), actor).await;
 
-        // -- set_confirmed: the success path ----------------------------------
+        // -- the success path --------------------------------------------------
         let confirmed = repo
             .set_confirmed(draft, actor, "2024-PUBLIC-1")
             .await
@@ -2191,7 +1864,7 @@ mod tests {
         assert_eq!(confirmed.return_number.as_deref(), Some("2024-PUBLIC-1"));
         assert!(confirmed.confirmed_at.is_some());
 
-        // -- set_confirmed: the duplicate submission ---------------------------
+        // -- the duplicate submission ------------------------------------------
         let err = repo
             .set_confirmed(draft, actor, "2024-PUBLIC-2")
             .await
@@ -2213,7 +1886,7 @@ mod tests {
             Some("2024-PUBLIC-1".to_string())
         );
 
-        // -- set_confirmed: a frozen document ---------------------------------
+        // -- a frozen document -------------------------------------------------
         let cancelled =
             seed_return_with_status(&pool, "Cancelled", supplier, purchase, d(2024, 6, 2), actor)
                 .await;
@@ -2229,7 +1902,7 @@ mod tests {
             other => panic!("expected Validation, got {other:?}"),
         }
 
-        // -- set_confirmed: a document that does not exist --------------------
+        // -- a document that does not exist ------------------------------------
         // A DIFFERENT variant, and the one a rewrite is most likely to collapse
         // into the other: not found is a 404, not a validation failure.
         let err = repo
@@ -2240,36 +1913,6 @@ mod tests {
             matches!(err, AppError::NotFound(_)),
             "expected NotFound for a missing document, got {err:?}"
         );
-
-        // -- create_payment: against a CONFIRMED document ---------------------
-        // Deliberately the confirmed one above, and deliberately with no state
-        // gate: `record_refund` collects against a document that already
-        // exists, so a `Draft` predicate here would refuse a real collection.
-        // The control on the residue window is the ORDER of `confirm`, not a
-        // predicate on the insert.
-        let payment = repo
-            .create_payment(
-                actor,
-                draft,
-                account,
-                method,
-                dec("42.50"),
-                d(2024, 6, 1),
-                None,
-            )
-            .await
-            .unwrap();
-        assert_eq!(payment.return_id, draft);
-        assert_eq!(payment.amount, dec("42.50"));
-        let listed = repo.list_payments(draft).await.unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].id, payment.id);
-        let second = repo
-            .create_payment(actor, draft, account, method, dec("1"), d(2024, 6, 1), None)
-            .await
-            .unwrap();
-        assert_ne!(second.id, payment.id);
-        assert_eq!(repo.list_payments(draft).await.unwrap().len(), 2);
     }
 
     // -- the aggregate a cross-return cap subtracts from -----------------------

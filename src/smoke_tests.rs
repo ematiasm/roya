@@ -358,6 +358,11 @@ async fn method_id(pool: &SqlitePool, name: &str) -> i64 {
 }
 
 /// The method row one account owns (same names repeat across accounts).
+///
+/// This is the read a payment test needs since migration 45: the seeded `Cash`
+/// belongs to `Caja`, and migration 44's guard refuses a payment naming a method
+/// another account owns — so a test that means "the account's own Cash" must ask
+/// for it by OWNER and name, not by name alone.
 async fn account_method_id(pool: &SqlitePool, account_id: i64, name: &str) -> i64 {
     let row: (i64,) =
         sqlx::query_as("SELECT id FROM payment_methods WHERE account_id = ? AND name = ?")
@@ -405,6 +410,15 @@ async fn customer_id_by_name(pool: &SqlitePool, name: &str) -> i64 {
     row.0
 }
 
+/// Create an account through the real web form with the given method ticks.
+///
+/// Ticking a method another account owns is expected to work here: the web
+/// handler routes every tick through `assign_or_duplicate`, which gives the new
+/// account its OWN row of that name (`UNIQUE(account_id, name)` permits it) and
+/// never steals the original. So this helper needs no special case — but a TEST
+/// that then wants to pay with "the" Cash must read the id THIS account owns
+/// (`method_id_in_account`), because the seeded `Cash` belongs to `Caja` since
+/// migration 45 and naming it would be refused by the design.
 async fn create_account_via_web(
     app: &Router,
     pool: &SqlitePool,
@@ -1667,16 +1681,21 @@ async fn seeded_pages_render_only_wired_htmx_targets() {
 #[tokio::test]
 async fn web_setup_flow_persists_account_methods_product_and_supplier_cost() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
+    let seeded = method_id(&pool, "Cash").await;
 
-    let account = create_account_via_web(&app, &pool, "SetupWallet", &[cash]).await;
+    let account = create_account_via_web(&app, &pool, "SetupWallet", &[seeded]).await;
     let catalog = payment_methods_catalog(&app, account).await;
+    let owned = account_method_id(&pool, account, "Cash").await;
     assert!(
         catalog["method_ids"]
             .as_array()
             .unwrap()
-            .contains(&json!(cash)),
-        "the created account must keep its allowlist: {catalog}"
+            .contains(&json!(owned)),
+        "the created account must own the methods it ticked: {catalog}"
+    );
+    assert_ne!(
+        owned, seeded,
+        "the seeded Cash stays with its seeded account: the form duplicates the name"
     );
 
     let product = create_product_via_web(&app, &pool, "SETUP-P", "2", "20").await;
@@ -1722,9 +1741,13 @@ async fn web_setup_flow_persists_account_methods_product_and_supplier_cost() {
 #[tokio::test]
 async fn cash_sale_confirm_deducts_stock_and_links_exactly_one_income() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
+    let seeded = method_id(&pool, "Cash").await;
 
-    let account = create_account_via_web(&app, &pool, "CashWallet", &[cash]).await;
+    let account = create_account_via_web(&app, &pool, "CashWallet", &[seeded]).await;
+    // The account owns its OWN Cash: the web form duplicates the name rather
+    // than stealing the seeded row from Caja, and migration 44's guard refuses a
+    // payment naming a method another account owns.
+    let cash = account_method_id(&pool, account, "Cash").await;
     let product = create_product_via_web(&app, &pool, "CASH-P", "2", "50").await;
     record_stock_via_web(&app, product, "10").await;
 
@@ -1760,7 +1783,14 @@ async fn cash_sale_confirm_deducts_stock_and_links_exactly_one_income() {
     );
     assert_eq!(txs[0]["kind"], json!("Income"));
     assert_eq!(txs[0]["id"].as_i64(), Some(payment_tx));
-    assert_eq!(txs[0]["reference"].as_str(), Some(sale_number.as_str()));
+    // P3 (decision 5): the movement is stamped with the DELIVERY's number, not the
+    // sale's — the money arrived once and may cover several documents.
+    let reference = txs[0]["reference"].as_str().expect("a reference");
+    assert!(
+        reference.contains("-PAY-"),
+        "the cash confirm's movement names its delivery, got {reference}"
+    );
+    assert_ne!(reference, sale_number.as_str());
     assert_eq!(dec(&txs[0]["amount"]), Decimal::from(75));
 
     // The rendered list fragment shows the confirmed, paid sale.
@@ -1773,9 +1803,10 @@ async fn cash_sale_confirm_deducts_stock_and_links_exactly_one_income() {
 #[tokio::test]
 async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
+    let seeded = method_id(&pool, "Cash").await;
 
-    let account = create_account_via_web(&app, &pool, "CreditWallet", &[cash]).await;
+    let account = create_account_via_web(&app, &pool, "CreditWallet", &[seeded]).await;
+    let cash = account_method_id(&pool, account, "Cash").await;
     let product = create_product_via_web(&app, &pool, "CREDIT-P", "2", "50").await;
     record_stock_via_web(&app, product, "10").await;
 
@@ -1808,7 +1839,11 @@ async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
     assert_eq!(txs.len(), 1);
     assert_eq!(txs[0]["kind"], json!("Income"));
     assert_eq!(dec(&txs[0]["amount"]), Decimal::from(30));
-    assert_eq!(txs[0]["reference"].as_str(), Some(sale_number.as_str()));
+    // P3 (decision 5): a collection's movement names the DELIVERY, and the sale is
+    // the description on the same row.
+    let reference = txs[0]["reference"].as_str().expect("a reference");
+    assert!(reference.contains("-PAY-"), "got {reference}");
+    assert_ne!(reference, sale_number.as_str());
 
     // Overpaying is rejected without touching finance.
     let (status, body) = pay_sale_via_web(&app, sale, cash, "30").await;
@@ -1855,7 +1890,12 @@ async fn credit_sale_pay_overpay_and_cancel_reverses_stock_and_refunds() {
         .expect("refund row");
     assert_eq!(refund["kind"], json!("Expense"));
     assert_eq!(dec(&refund["amount"]), Decimal::from(30));
-    assert_eq!(refund["reference"].as_str(), Some(sale_number.as_str()));
+    // T3d: the refund is an `Out` DELIVERY, so its movement carries that delivery's
+    // number and not the sale's. The sale is what it reverses; the money leaving is its
+    // own citable document.
+    let refund_reference = refund["reference"].as_str().expect("a reference");
+    assert!(refund_reference.contains("-PAY-"), "got {refund_reference}");
+    assert_ne!(refund_reference, sale_number.as_str());
     let original = txs
         .iter()
         .find(|t| t["id"].as_i64() == Some(original_tx))
@@ -2092,9 +2132,12 @@ async fn collection_flow_derives_balance_ageing_and_receipt_total() {
 #[tokio::test]
 async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
+    let seeded_cash = method_id(&pool, "Cash").await;
 
-    let account = create_account_via_web(&app, &pool, "PurchaseWallet", &[cash]).await;
+    let account = create_account_via_web(&app, &pool, "PurchaseWallet", &[seeded_cash]).await;
+    // The account owns its own Cash; the purchase below is paid FROM it, so the
+    // method named must be that row (migration 44 guards the pair).
+    let cash = account_method_id(&pool, account, "Cash").await;
     let (status, body) = post_form(
         &app,
         "/web/transactions",
@@ -2162,10 +2205,18 @@ async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
         .expect("expense row");
     assert_eq!(expense["kind"], json!("Expense"));
     assert_eq!(dec(&expense["amount"]), Decimal::from(135));
+    let delivered_number: String = sqlx::query_scalar(
+        "SELECT number FROM payments WHERE transaction_id = ?",
+    )
+    .bind(expense_tx)
+    .fetch_one(&pool)
+    .await
+    .expect("purchase payment has a delivery number");
     assert_eq!(
         expense["reference"].as_str(),
-        Some(purchase_number.as_str())
+        Some(delivered_number.as_str())
     );
+    assert_ne!(delivered_number, purchase_number);
 
     // Cancel the confirmed purchase: stock returns and the Expense is refunded.
     let (status, body) = post_form(
@@ -2196,19 +2247,31 @@ async fn purchase_flow_from_suggestion_confirms_cash_and_reverses_on_cancel() {
         .expect("refund row");
     assert_eq!(refund["kind"], json!("Income"));
     assert_eq!(dec(&refund["amount"]), Decimal::from(135));
-    assert_eq!(refund["reference"].as_str(), Some(purchase_number.as_str()));
+    // T3d: the reversal is a DELIVERY, so its movement carries that delivery's number
+    // and the purchase stays the description.
+    let refund_reference = refund["reference"].as_str().expect("a reference");
+    assert!(refund_reference.contains("-PAY-"), "got {refund_reference}");
+    assert_ne!(refund_reference, purchase_number.as_str());
 }
 
-/// A method with no owning account rejects the payment with the actionable
-/// message; assigning it to the account afterwards makes the same payment
-/// succeed.
+/// Migration 45 removed "a method with no owning account": ownership is a NOT
+/// NULL column now. What replaced that broken state are the edges that ARE
+/// reachable, and each one has a different, deliberate answer:
+///
+///   (a) paying with a method another account owns is NOT an error — the account
+///       is DERIVED from the method, so the money goes to the real owner;
+///   (b) the account EDITOR refuses a foreign method outright, naming the fix;
+///   (c) an account that owns the method collects through it, which is the flow
+///       the seed makes possible on a fresh install.
+///
+/// This replaces `payment_guard_rejects_then_succeeds_after_methods_configured`,
+/// whose premise (an unassigned Cash that assigning makes usable) is no longer
+/// representable.
 #[tokio::test]
-async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
+async fn payment_guards_derive_the_owner_refuse_foreign_edits_and_stay_inert() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
 
-    // REST-created accounts own nothing and Cash is unassigned: no account can
-    // be derived, the realistic broken state.
+    // A REST-created account owns nothing.
     let (status, body) = post_json(&app, "/api/accounts", json!({ "name": "GuardAccount" })).await;
     assert_eq!(status, StatusCode::CREATED, "{body}");
     let account = json_body(&body)["id"].as_i64().unwrap();
@@ -2227,49 +2290,155 @@ async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
     add_sale_line_via_web(&app, sale, product, "1").await;
     confirm_sale_via_web(&app, sale, None).await;
 
-    let (status, body) = pay_sale_via_web(&app, sale, cash, "25").await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert!(
-        body.contains("not assigned to any account"),
-        "message must tell the user what to do: {body}"
+    // (a) The account follows the METHOD, not the caller's intention.
+    let foreign = method_id(&pool, "Cash").await;
+    let owner: i64 = sqlx::query_scalar("SELECT account_id FROM payment_methods WHERE id = ?")
+        .bind(foreign)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_ne!(owner, account, "the seeded Cash belongs to another account");
+    let (status, body) = pay_sale_via_web(&app, sale, foreign, "25").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        transactions_for(&app, account).await.len(),
+        0,
+        "the payment must NOT land in the account the caller had in mind"
     );
-    assert!(
-        transactions_for(&app, account).await.is_empty(),
-        "rejected payment must not touch finance"
-    );
-    assert!(
-        sale_detail(&app, sale).await["payments"]
-            .as_array()
-            .unwrap()
-            .is_empty(),
-        "rejected payment must not land on the sale"
+    assert_eq!(
+        transactions_for(&app, owner).await.len(),
+        1,
+        "it lands in the account that owns the method"
     );
 
-    // Configure through the same plain form the account detail page renders.
+    // (b) The EDITOR has no such freedom: it refuses a method owned elsewhere,
+    // and the message names the one action that works.
     let (status, body) = post_browser_form(
         &app,
         &format!("/accounts/{account}/payment-methods"),
-        &format!("method_ids={cash}"),
+        &format!("method_ids={foreign}"),
     )
     .await;
-    assert_eq!(status, StatusCode::SEE_OTHER, "{body}");
-
-    let (status, body) = pay_sale_via_web(&app, sale, cash, "25").await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "payment after configuration: {body}"
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(
+        body.contains(&format!("belongs to account {owner}")),
+        "the refusal must name the owning account: {body}"
     );
-    assert_eq!(
-        sale_detail(&app, sale).await["payments"]
+    assert!(
+        body.contains("create a Cash method in this account"),
+        "and the fix an operator can perform: {body}"
+    );
+    assert!(
+        payment_methods_catalog(&app, account).await["method_ids"]
             .as_array()
             .unwrap()
-            .len(),
-        1
+            .is_empty(),
+        "a refused edit must not assign anything"
     );
-    let txs = transactions_for(&app, account).await;
-    assert_eq!(txs.len(), 1);
+
+    // (c) Create-through-the-form DOES own its method (it duplicates the name),
+    // and a payment naming that row succeeds and lands in the new account.
+    let wallet = create_account_via_web(&app, &pool, "GuardWallet", &[foreign]).await;
+    let owned = account_method_id(&pool, wallet, "Cash").await;
+    assert_ne!(owned, foreign, "the form mints the account's own row");
+    let second =
+        create_sale_draft_via_web(&app, &pool, "GuardFlowBuyer2", "Credit", "2024-06-03").await;
+    add_sale_line_via_web(&app, second, product, "1").await;
+    confirm_sale_via_web(&app, second, None).await;
+    let (status, body) = pay_sale_via_web(&app, second, owned, "25").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let txs = transactions_for(&app, wallet).await;
+    assert_eq!(txs.len(), 1, "the collection lands in the wallet: {txs:?}");
     assert_eq!(txs[0]["kind"], json!("Income"));
+}
+
+/// **The multi-invoice collection, which is the shape the re-based invariant is
+/// about.** One handover of money covering THREE sales of one customer, collected in
+/// a single request.
+///
+/// This exists because the re-based `claim_transaction` needed a fixture that
+/// exercises it: with three rows naming one transaction, an invariant still keyed on
+/// the ROW would call that a violation, and without this test the difference between
+/// the old and the new concept would not be measurable at all. The mutation that
+/// proves it is putting the row back as the claim's identity.
+#[tokio::test]
+async fn one_collection_over_three_invoices_writes_one_movement_and_three_shares() {
+    let (app, pool) = test_app().await;
+    let cash = method_id(&pool, "Cash").await;
+    let _wallet = create_account_via_web(&app, &pool, "MultiCollect", &[cash]).await;
+    let product = create_product_via_web(&app, &pool, "MULTI-P", "1", "50").await;
+    record_stock_via_web(&app, product, "30").await;
+    let customer = seed_customer(&pool, "Multi Buyer", None, None).await;
+
+    // Three credit sales, three due dates, so the oldest-first plan covers all three.
+    for (sale_date, due) in [
+        ("2024-05-01", "2024-06-01"),
+        ("2024-05-02", "2024-06-10"),
+        ("2024-05-03", "2024-06-20"),
+    ] {
+        let sale = create_sale_draft_on_date(&app, customer, "Credit", sale_date, due).await;
+        add_sale_line_via_web(&app, sale, product, "1").await;
+        confirm_sale_via_web(&app, sale, None).await;
+    }
+    // 3 x 25 = 75 owed before the collection.
+
+    // ONE collection of 60, which the plan spreads over the three sales.
+    let (status, resp) = post_form(
+        &app,
+        "/web/customer-receipts",
+        &format!("customer_id={customer}&method_id={cash}&amount=60&date=2024-06-21"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "collect: {resp}");
+
+    // ONE movement for the delivery, not one per invoice.
+    let movements: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM transactions t \
+          WHERE t.reference GLOB '[0-9][0-9][0-9][0-9]-PAY-[0-9][0-9][0-9][0-9][0-9][0-9]'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(movements, 1, "one handover of money moves cash once");
+
+    // Its document carries the whole amount and is fully applied.
+    let (delivery_id, delivered): (i64, String) =
+        sqlx::query_as("SELECT id, amount FROM payments ORDER BY id")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(delivered, "60");
+    let shares: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM payment_allocations WHERE payment_id = ?")
+            .bind(delivery_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(shares, 3, "one share per covered invoice");
+
+    // THREE legacy rows, all naming that ONE movement: the shape the invariant was
+    // re-based for, and the reason "one row per transaction" is the wrong claim.
+    let linked: Vec<(i64, i64)> = sqlx::query_as(
+        "SELECT DISTINCT transaction_id, COUNT(*) OVER () FROM sale_payments \
+          WHERE transaction_id IS NOT NULL",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        linked.len(),
+        1,
+        "every covered sale points at the same movement: {linked:?}"
+    );
+
+    // And the whole thing passes the traceability invariant, which is what makes the
+    // re-basing a claim rather than a hope.
+    assert_payment_links_are_traceable(&pool).await;
+
+    // The customer owes what is left: 75 collected 60, so 15 spread over the newest.
+    let (status, body) = get(&app, &format!("/api/customers/{customer}")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(dec(&json_body(&body)["balance"]), Decimal::from(15));
 }
 
 /// Money invariants over a database built by real flows: every account balance
@@ -2278,10 +2447,17 @@ async fn payment_guard_rejects_then_succeeds_after_methods_configured() {
 #[tokio::test]
 async fn money_invariants_hold_for_balances_and_payment_links() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
+    let seeded_cash = method_id(&pool, "Cash").await;
 
     // Account A: cash sale posts Income; credit sale posts Income then a refund.
-    let _account_a = create_account_via_web(&app, &pool, "InvA", &[cash]).await;
+    // Paying names the Cash THIS account owns — the seeded row belongs to Caja
+    // and migration 44's guard would refuse the pair.
+    let account_a = create_account_via_web(&app, &pool, "InvA", &[seeded_cash]).await;
+    let cash = account_method_id(&pool, account_a, "Cash").await;
+    // The seeded Caja is a third account this test did not create, so every
+    // count below is about the accounts the flow built. It is not noise: the
+    // seed is why a fresh install can collect at all, and this test is where
+    // "the fixture's accounts" and "the seed's account" first meet.
     let product_a = create_product_via_web(&app, &pool, "INV-A", "1", "50").await;
     record_stock_via_web(&app, product_a, "10").await;
     let cash_sale = create_sale_draft_via_web(&app, &pool, "InvCashBuyer", "Cash", "").await;
@@ -2346,7 +2522,11 @@ async fn money_invariants_hold_for_balances_and_payment_links() {
     assert_eq!(status, StatusCode::OK, "{body}");
     let accounts_json = json_body(&body);
     let accounts = accounts_json["accounts"].as_array().unwrap();
-    assert_eq!(accounts.len(), 2, "{accounts:?}");
+    assert_eq!(
+        accounts.len(),
+        3,
+        "the seed's Caja plus the two accounts this flow created: {accounts:?}"
+    );
     for account in accounts {
         let account_id = account["id"].as_i64().unwrap();
         let balance = dec(&account["balance"]);
@@ -2409,32 +2589,67 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
     // route accepts `refund_transaction_id`. The global claim below keeps the
     // invariant honest even then.
     let mut owners: HashMap<i64, String> = HashMap::new();
-    let sale_links: Vec<(i64, Option<i64>, Option<i64>, i64, String, Option<String>)> =
-        sqlx::query_as(
-            "SELECT sp.id, sp.transaction_id, sp.refund_transaction_id, sp.account_id, sp.amount, s.sale_number
+    // P3 (decision 5): a movement is traceable to the DELIVERY it belongs to, not
+    // to the document the money pays for. So the expected reference is the payment
+    // number, read from the `payments` row whose movement this is — which is also a
+    // stronger invariant than the old sale-number comparison, because it checks the
+    // delivery EXISTS rather than that a string matches.
+    //
+    // The sale number stays on the row as the DESCRIPTION (the human label), so the
+    // sale-side facts below still assert what they always did.
+    let sale_links: Vec<(
+        i64,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT sp.id, sp.transaction_id, sp.refund_transaction_id, sp.account_id, sp.amount,
+                    s.sale_number,
+                    (SELECT p.number FROM payments p WHERE p.transaction_id = sp.transaction_id)
              FROM sale_payments sp JOIN sales s ON s.id = sp.sale_id",
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
-    for (payment_id, transaction_id, refund_transaction_id, account_id, amount_text, sale_number) in
-        sale_links
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
+    for (
+        payment_id,
+        transaction_id,
+        refund_transaction_id,
+        account_id,
+        amount_text,
+        sale_number,
+        delivered_number,
+    ) in sale_links
     {
         let sale_number = sale_number.ok_or_else(|| {
             format!("sale payment {payment_id} belongs to a sale without a number")
         })?;
+        // What the ORIGINAL movement must be stamped with: the delivery's number.
+        // The sale number is only the fallback, so a row with no delivery at all
+        // still fails with a message about the link rather than about a string.
+        let movement_reference = delivered_number.as_deref().unwrap_or(&sale_number);
         let transaction_id = transaction_id
             .ok_or_else(|| format!("sale payment {payment_id} has no transaction_id"))?;
         let payment_amount = Decimal::from_str(&amount_text).map_err(|e| {
             format!("sale payment {payment_id} has invalid amount {amount_text}: {e}")
         })?;
-        let original =
-            check_original_transaction(pool, "sale", payment_id, transaction_id, &sale_number)
-                .await?;
+        let original = check_original_transaction(
+            pool,
+            "sale",
+            payment_id,
+            transaction_id,
+            movement_reference,
+        )
+        .await?;
         claim_transaction(
             &mut owners,
             transaction_id,
-            format!("sale payment {payment_id} transaction_id"),
+            // The claim's identity is the DELIVERY, not the row: the rows of one
+            // delivery legitimately share a movement, which is decision 5.
+            format!("sale delivery {movement_reference} transaction_id"),
         )?;
         if let Some(refund_id) = refund_transaction_id {
             if refund_id == transaction_id {
@@ -2461,14 +2676,23 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
         }
     }
 
-    let purchase_links: Vec<(i64, Option<i64>, Option<i64>, i64, String, Option<String>)> =
-        sqlx::query_as(
-            "SELECT pp.id, pp.transaction_id, pp.refund_transaction_id, pp.account_id, pp.amount, p.purchase_number
-             FROM purchase_payments pp JOIN purchases p ON p.id = pp.purchase_id",
-        )
-        .fetch_all(pool)
-        .await
-        .map_err(|e| e.to_string())?;
+    let purchase_links: Vec<(
+        i64,
+        Option<i64>,
+        Option<i64>,
+        i64,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = sqlx::query_as(
+        "SELECT pp.id, pp.transaction_id, pp.refund_transaction_id, pp.account_id, pp.amount,
+                p.purchase_number,
+                (SELECT pay.number FROM payments pay WHERE pay.transaction_id = pp.transaction_id)
+         FROM purchase_payments pp JOIN purchases p ON p.id = pp.purchase_id",
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(|e| e.to_string())?;
     for (
         payment_id,
         transaction_id,
@@ -2476,11 +2700,15 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
         account_id,
         amount_text,
         purchase_number,
+        delivered_number,
     ) in purchase_links
     {
         let purchase_number = purchase_number.ok_or_else(|| {
             format!("purchase payment {payment_id} belongs to a purchase without a number")
         })?;
+        // As on sales, the original movement names its delivery. The purchase number
+        // is only the fallback, keeping a missing delivery attributable to this link.
+        let movement_reference = delivered_number.as_deref().unwrap_or(&purchase_number);
         let transaction_id = transaction_id
             .ok_or_else(|| format!("purchase payment {payment_id} has no transaction_id"))?;
         let payment_amount = Decimal::from_str(&amount_text).map_err(|e| {
@@ -2491,13 +2719,14 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
             "purchase",
             payment_id,
             transaction_id,
-            &purchase_number,
+            movement_reference,
         )
         .await?;
         claim_transaction(
             &mut owners,
             transaction_id,
-            format!("purchase payment {payment_id} transaction_id"),
+            // Rows of one delivery legitimately share its movement.
+            format!("purchase delivery {movement_reference} transaction_id"),
         )?;
         if let Some(refund_id) = refund_transaction_id {
             if refund_id == transaction_id {
@@ -2525,20 +2754,29 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
     }
 
     // Orphan movements: every transaction whose reference looks like a document
-    // number must be claimed by some payment, as original or refund. A failure
-    // between creating the movement and inserting the payment row leaves one of
-    // these (the project deliberately does not share transactions across
-    // modules), and nothing else would notice it. Manual transactions keep a
-    // NULL reference and stay exempt.
+    // number must be claimed by some payment, as original or refund.
+    //
+    // **THE GLOB HAD TO GROW, and its growth is the point.** Before P3 the pattern
+    // knew only `-SALE-` and `-PURCH-`, because those were the only families a
+    // movement was ever stamped with. From P3 a movement is stamped with the
+    // DELIVERY it belongs to (`-PAY-`), so the old pattern silently matched nothing
+    // and this check became a no-op that still reported success — the worst failure
+    // mode a guard has. The families are listed explicitly, in one place, so adding
+    // a fourth means touching this line instead of quietly losing coverage.
+    //
+    // `-SRET-` and `-PRET-` stay out of it on purpose: a return's credit note does
+    // not post a movement of its own, so a row carrying one has nothing to claim.
     let orphans: Vec<(i64,)> = sqlx::query_as(
         "SELECT t.id FROM transactions t \
          WHERE t.reference IS NOT NULL \
-           AND (t.reference GLOB '[0-9][0-9][0-9][0-9]-SALE-[0-9][0-9][0-9][0-9][0-9][0-9]' \
+           AND (t.reference GLOB '[0-9][0-9][0-9][0-9]-PAY-[0-9][0-9][0-9][0-9][0-9][0-9]' \
+             OR t.reference GLOB '[0-9][0-9][0-9][0-9]-SALE-[0-9][0-9][0-9][0-9][0-9][0-9]' \
              OR t.reference GLOB '[0-9][0-9][0-9][0-9]-PURCH-[0-9][0-9][0-9][0-9][0-9][0-9]') \
            AND NOT EXISTS (SELECT 1 FROM sale_payments sp \
                            WHERE sp.transaction_id = t.id OR sp.refund_transaction_id = t.id) \
            AND NOT EXISTS (SELECT 1 FROM purchase_payments pp \
                            WHERE pp.transaction_id = t.id OR pp.refund_transaction_id = t.id) \
+           AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.transaction_id = t.id) \
          ORDER BY t.id",
     )
     .fetch_all(pool)
@@ -2547,7 +2785,7 @@ async fn check_payment_links_are_traceable(pool: &SqlitePool) -> Result<(), Stri
     if !orphans.is_empty() {
         let ids: Vec<i64> = orphans.into_iter().map(|(id,)| id).collect();
         return Err(format!(
-            "transactions with a document reference are claimed by no payment: {ids:?} (every document movement must be linked as transaction_id or refund_transaction_id)"
+            "transactions with a document reference are claimed by no payment: {ids:?} (every document movement must be linked as transaction_id or refund_transaction_id, or be the movement of a payments row)"
         ));
     }
     Ok(())
@@ -2605,13 +2843,20 @@ fn claim_transaction(
     transaction_id: i64,
     owner: String,
 ) -> Result<(), String> {
-    if let Some(existing) = owners.get(&transaction_id) {
-        return Err(format!(
-            "transaction {transaction_id} is claimed by both {existing} and {owner}; a transaction belongs to exactly one payment"
-        ));
+    match owners.get(&transaction_id) {
+        // The SAME identity claiming a transaction twice is not a collision: the rows
+        // of one delivery all name it, by decision 5. Two DIFFERENT identities
+        // claiming one transaction is the anomaly — that is a cross-delivery swap —
+        // and it is what this map exists to catch.
+        Some(existing) if *existing == owner => Ok(()),
+        Some(existing) => Err(format!(
+            "transaction {transaction_id} is claimed by both {existing} and {owner}; a transaction belongs to exactly one delivery"
+        )),
+        None => {
+            owners.insert(transaction_id, owner);
+            Ok(())
+        }
     }
-    owners.insert(transaction_id, owner);
-    Ok(())
 }
 
 /// The original transaction must exist and carry the document's reference.
@@ -2632,10 +2877,17 @@ async fn check_original_transaction(
     Ok(tx)
 }
 
-/// A refund must reverse its own payment: same document reference, the payment's
-/// account, the opposite kind of the original transaction and the payment amount.
-/// The reference alone is not enough because every payment of a document shares
-/// it, so a cross-payment swap would otherwise pass.
+/// A refund must reverse its own payment: the payment's account, the opposite kind
+/// of the original transaction and the payment amount.
+///
+/// **The reference is deliberately NOT compared to the original's.** It used to be,
+/// back when both named the document; under P3 (decision 5) the original names the
+/// DELIVERY and the refund names the document it reverses, so the two are different
+/// by design and comparing them would fail every healthy fixture. The identity a
+/// claim needs comes from the other three facts plus [`claim_transaction`]'s
+/// exactly-one-owner map — which was already the part that made a cross-payment
+/// swap fail, as the original comment admitted ("the reference alone is not
+/// enough").
 #[allow(clippy::too_many_arguments)]
 async fn check_refund_transaction(
     pool: &SqlitePool,
@@ -2648,10 +2900,12 @@ async fn check_refund_transaction(
     original: &MoneyTransaction,
 ) -> Result<(), String> {
     let refund = fetch_money_transaction(pool, label, payment_id, refund_id).await?;
-    if refund.reference.as_deref() != Some(document_number) {
+    // A refund must still BE traceable to a document — a movement with no reference
+    // at all is the anomaly this invariant exists for. It just does not have to name
+    // the same DOCUMENT as the original: the original names the delivery.
+    if refund.reference.is_none() {
         return Err(format!(
-            "{label} payment {payment_id} refund transaction {refund_id} reference {:?} != document {document_number:?}",
-            refund.reference
+            "{label} payment {payment_id} refund transaction {refund_id} carries no reference at all"
         ));
     }
     if refund.account_id != payment_account_id {
@@ -3498,10 +3752,21 @@ async fn money_invariant_catches_equal_amount_pointer_swaps() {
 }
 
 /// The payment-traceability invariant must also see movements that no payment
-/// claims: a failure between creating the finance movement and inserting the
-/// payment leaves an orphan Income that inflates the account while the sale
-/// stays unpaid. The collection is deliberately not transactional across
-/// modules, so the invariant detects the residual instead.
+/// claims, because that is what an unlinked movement looks like: an Income that
+/// inflates the account while no document behind it exists.
+///
+/// **The fixture changed, and the change is the finding.** It used to inject a
+/// failure on the `sale_payments` INSERT and then look for the movement the
+/// aborted payment had already committed — that is, it relied on the very defect P3
+/// closed. With one unit, that trigger now aborts the whole delivery and takes the
+/// movement with it, so the "orphan" the old fixture hunted cannot be produced by
+/// the application at all.
+///
+/// Which is the stronger statement, and it is two assertions instead of one: the
+/// injected failure leaves NOTHING (proved in `services::sales`, and again below),
+/// and the invariant still catches a hand-written orphan. The orphan is therefore
+/// created the only way it can still happen — direct SQL, exactly the threat model
+/// migration 44 and the cap trigger also answer to.
 #[tokio::test]
 async fn money_invariant_catches_orphan_document_movement() {
     let (app, pool) = test_app().await;
@@ -3517,7 +3782,9 @@ async fn money_invariant_catches_orphan_document_movement() {
         .unwrap()
         .to_string();
 
-    // Injected failure between the movement and the payment row.
+    // (1) The injected failure leaves NOTHING. The trigger aborts the legacy row,
+    // which is the LAST write of the delivery, so the movement, the payment document,
+    // its share and the ledger entry are all rolled back with it.
     sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
         "CREATE TRIGGER injected_payment_failure BEFORE INSERT ON sale_payments \
          WHEN NEW.sale_id = {sale} BEGIN SELECT RAISE(ABORT, 'injected payment failure'); END"
@@ -3528,11 +3795,42 @@ async fn money_invariant_catches_orphan_document_movement() {
     let (status, body) = pay_sale_via_web(&app, sale, cash, "10").await;
     assert!(status.is_server_error(), "{status} {body}");
 
-    let orphan: (i64,) = sqlx::query_as(
-        "SELECT t.id FROM transactions t WHERE t.reference = ? \
-         AND NOT EXISTS (SELECT 1 FROM sale_payments sp \
-                         WHERE sp.transaction_id = t.id OR sp.refund_transaction_id = t.id)",
+    let orphans_after_failure: (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM transactions t \
+         WHERE t.reference GLOB '[0-9][0-9][0-9][0-9]-PAY-[0-9][0-9][0-9][0-9][0-9][0-9]'",
     )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        orphans_after_failure.0, 0,
+        "the aborted delivery left no movement behind at all"
+    );
+    let documents: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM payments")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(documents.0, 0, "and no delivery document");
+    // The sale is still unpaid: the refusal was a refusal, not a partial write.
+    assert_eq!(
+        sale_detail(&app, sale).await["payments"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // (2) And the invariant still sees an orphan when one is written by hand, which
+    // is now the only way it can exist.
+    let account: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'OrphanInv'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let orphan: (i64,) = sqlx::query_as(
+        "INSERT INTO transactions (account_id, kind, amount, description, reference, date, created_by) \
+         VALUES (?, 'Income', '10', ?, '2024-PAY-999999', '2024-06-02', 1) RETURNING id",
+    )
+    .bind(account)
     .bind(&sale_number)
     .fetch_one(&pool)
     .await
@@ -5339,8 +5637,9 @@ fn accessible_name_resolution_accepts_wrapping_and_for_labels() {
 #[tokio::test]
 async fn sale_record_controls_resolve_accessible_names() {
     let (app, pool) = test_app().await;
+    // NOT named "Caja": migration 45 seeds that name and the form answers 409.
     let cash = method_id(&pool, "Cash").await;
-    let _account = create_account_via_web(&app, &pool, "Caja", &[cash]).await;
+    let _account = create_account_via_web(&app, &pool, "A11Y Wallet", &[cash]).await;
     let product = create_product_via_web(&app, &pool, "A11Y-L", "1", "50").await;
     let sale = create_sale_draft_via_web(&app, &pool, "A11yBuyer", "Cash", "").await;
     add_sale_line_via_web(&app, sale, product, "1").await;
@@ -5421,8 +5720,11 @@ async fn referenced_id_guard_rejects_a_bare_id_added_to_a_guarded_page_copy() {
 #[tokio::test]
 async fn customer_statement_resolves_receipt_account_and_method_names() {
     let (app, pool) = test_app().await;
-    let cash = method_id(&pool, "Cash").await;
-    let _account = create_account_via_web(&app, &pool, "GapWallet", &[cash]).await;
+    let seed_cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "GapWallet", &[seed_cash]).await;
+    // The receipt below is collected INTO this account, so it names the Cash this
+    // account owns.
+    let cash = account_method_id(&pool, account, "Cash").await;
     let product = create_product_via_web(&app, &pool, "GAP-P", "1", "50").await;
     record_stock_via_web(&app, product, "10").await;
     let customer = seed_customer(&pool, "GapBuyer", None, None).await;
@@ -7080,7 +7382,10 @@ async fn ac19_the_upgrade_attributes_every_legacy_row_to_the_system_sentinel() {
             .await
             .unwrap();
     assert_eq!(accounts.0, accounts.1, "no row lost, all attributed");
-    assert_eq!(accounts.0, 1, "the legacy account survived");
+    assert_eq!(
+        accounts.0, 2,
+        "the legacy account survived, and migration 45's seeded Caja is attributed to the same sentinel"
+    );
     let transactions: (i64, i64) =
         sqlx::query_as("SELECT COUNT(*), COUNT(*) FROM transactions WHERE created_by = ?")
             .bind(sentinel.0)
@@ -7099,7 +7404,10 @@ async fn ac19_the_upgrade_attributes_every_legacy_row_to_the_system_sentinel() {
             .await
             .unwrap();
     assert_eq!(methods.0, methods.1, "no row lost, all attributed");
-    assert_eq!(methods.0, 6, "the five seeds plus the legacy one survived");
+    assert_eq!(
+        methods.0, 1,
+        "only the seeded Cash survives: migration 45 deletes `Legacy Method` too, because it is unowned and has no payment history"
+    );
 
     // `created_by` is NOT NULL afterwards: a write that omits the actor
     // is refused by the database, which is what makes every future insert
@@ -7448,6 +7756,44 @@ async fn ac19_the_inventory_migration_recreates_a_missing_sentinel() {
 // beyond the sentinel.
 // ---------------------------------------------------------------------------
 
+/// The `(account, method)` pair a pre-44 legacy row must name, planted before
+/// migration 44 exists and therefore before its `BEFORE INSERT` guard does.
+///
+/// The pair cannot be arbitrary: `sale_payments.method_id` carries `DEFAULT 1`,
+/// so a fixture that names only `account_id` silently pairs it with method 1 —
+/// `Cash` — and migration 44 then refuses the row when it later runs, taking the
+/// whole upgrade test down with it. Building the row's own method inside the
+/// row's own account is what makes the pair true at the moment it is written,
+/// which is the only thing the guard asks.
+///
+/// `created_by` is named explicitly because these fixtures run up to migration
+/// 31, where the audit columns do not exist yet: a column that is not there
+/// cannot be filled by a statement.
+async fn legacy_account_and_own_method(
+    pool: &sqlx::SqlitePool,
+    account_name: &str,
+    method_name: &str,
+    sentinel: i64,
+) -> (i64, i64) {
+    let account: (i64,) =
+        sqlx::query_as("INSERT INTO accounts (name, created_by) VALUES (?, ?) RETURNING id")
+            .bind(account_name)
+            .bind(sentinel)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let method: (i64,) = sqlx::query_as(
+        "INSERT INTO payment_methods (name, account_id, created_by) VALUES (?, ?, ?) RETURNING id",
+    )
+    .bind(method_name)
+    .bind(account.0)
+    .bind(sentinel)
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (account.0, method.0)
+}
+
 /// A pool with the migration chain stopped just after the inventory audit (the
 /// pre-32 sales/customers schema is real) plus legacy business rows planted
 /// the way pre-audit code wrote them: no created_by column exists to fill.
@@ -7483,13 +7829,8 @@ async fn upgraded_pool_with_legacy_sales_and_customer_rows(
         "no user beyond the sentinel before the upgrade"
     );
 
-    let account_id: (i64,) = sqlx::query_as(
-        "INSERT INTO accounts (name, created_by) VALUES ('legacy wallet', ?) RETURNING id",
-    )
-    .bind(sentinel.0)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (account_id, method_id) =
+        legacy_account_and_own_method(&pool, "legacy wallet", "legacy cash", sentinel.0).await;
 
     let customer_id: (i64,) = sqlx::query_as(
         "INSERT INTO customers (name, is_walkin, is_active) \
@@ -7517,19 +7858,21 @@ async fn upgraded_pool_with_legacy_sales_and_customer_rows(
     .unwrap();
     let payment_id: (i64,) = sqlx::query_as(
         "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date) \
-         VALUES (?, ?, 1, '5', '2024-05-10') RETURNING id",
+         VALUES (?, ?, ?, '5', '2024-05-10') RETURNING id",
     )
     .bind(sale_id.0)
-    .bind(account_id.0)
+    .bind(account_id)
+    .bind(method_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     let receipt_id: (i64,) = sqlx::query_as(
         "INSERT INTO customer_receipts (customer_id, account_id, method_id, date, notes) \
-         VALUES (?, ?, 1, '2024-06-20', NULL) RETURNING id",
+         VALUES (?, ?, ?, '2024-06-20', NULL) RETURNING id",
     )
     .bind(customer_id.0)
-    .bind(account_id.0)
+    .bind(account_id)
+    .bind(method_id)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -7966,13 +8309,13 @@ async fn upgraded_pool_with_legacy_purchases_and_supplier_rows(
     .fetch_one(&pool)
     .await
     .unwrap();
-    let account_id: (i64,) = sqlx::query_as(
-        "INSERT INTO accounts (name, created_by) VALUES ('legacy purchase wallet', ?) RETURNING id",
+    let (account_id, method_id) = legacy_account_and_own_method(
+        &pool,
+        "legacy purchase wallet",
+        "legacy purchase cash",
+        sentinel.0,
     )
-    .bind(sentinel.0)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    .await;
     let purchase_id: (i64,) = sqlx::query_as(
         "INSERT INTO purchases (purchase_number, supplier_id, status, payment_type, purchase_date, due_date) \
          VALUES ('2024-PURCH-000001', ?, 'Confirmed', 'Credit', '2024-05-02', '2024-06-01') RETURNING id",
@@ -7992,10 +8335,11 @@ async fn upgraded_pool_with_legacy_purchases_and_supplier_rows(
     .unwrap();
     let payment_id: (i64,) = sqlx::query_as(
         "INSERT INTO purchase_payments (purchase_id, account_id, method_id, amount, date) \
-         VALUES (?, ?, 1, '5', '2024-05-10') RETURNING id",
+         VALUES (?, ?, ?, '5', '2024-05-10') RETURNING id",
     )
     .bind(purchase_id.0)
-    .bind(account_id.0)
+    .bind(account_id)
+    .bind(method_id)
     .fetch_one(&pool)
     .await
     .unwrap();
@@ -9511,8 +9855,11 @@ struct DrawerFixture {
 }
 
 async fn seed_drawer_fixture(app: &Router, pool: &SqlitePool) -> DrawerFixture {
-    let cash = method_id(pool, "Cash").await;
-    let account = create_account_via_web(app, pool, "DrawerWallet", &[cash]).await;
+    let seed_cash = method_id(pool, "Cash").await;
+    let account = create_account_via_web(app, pool, "DrawerWallet", &[seed_cash]).await;
+    // The drawer names the account that owns the payment, so the payment must
+    // name THIS account's Cash — the seed's row belongs to Caja.
+    let cash = account_method_id(pool, account, "Cash").await;
     let product = create_product_via_web(app, pool, "DRAWER-P", "1", "50").await;
     record_stock_via_web(app, product, "10").await;
     let buyer = seed_customer(pool, "DrawerBuyer", None, None).await;
@@ -10269,8 +10616,12 @@ async fn due_days_supplier_cash_confirm_remains_without_a_due_date() {
         "Cash must not submit the visible Credit suggestion: {due_input}"
     );
 
-    let cash = method_id(&pool, "Cash").await;
-    let account = create_account_via_web(&app, &pool, "Due Cash Account", &[cash]).await;
+    let seeded_cash = method_id(&pool, "Cash").await;
+    let account = create_account_via_web(&app, &pool, "Due Cash Account", &[seeded_cash]).await;
+    // Funded with the account's OWN Cash: this test is about the due date, and
+    // the seed's row belongs to Caja, which would make the confirm a guard
+    // refusal rather than the Cash purchase under test.
+    let cash = account_method_id(&pool, account, "Cash").await;
     let (status, body) = post_form(
         &app,
         "/web/transactions",

@@ -79,30 +79,40 @@ pub trait PaymentMethodRepository: Send + Sync {
     ) -> AppResult<Option<PaymentMethod>>;
     /// First row with this name by id. Names repeat across accounts, so this is
     /// only a seed-order convenience; account-scoped reads use
-    /// `find_method_in_account` / `find_unassigned_by_name`.
+    /// `find_method_in_account`.
     async fn find_method_by_name(&self, name: &str) -> AppResult<Option<PaymentMethod>>;
     async fn find_method_in_account(
         &self,
         account_id: i64,
         name: &str,
     ) -> AppResult<Option<PaymentMethod>>;
-    async fn find_unassigned_by_name(&self, name: &str) -> AppResult<Option<PaymentMethod>>;
     /// The account's own methods (ownership, not an allowlist).
     async fn list_by_account(&self, account_id: i64) -> AppResult<Vec<PaymentMethod>>;
-    async fn list_unassigned(&self) -> AppResult<Vec<PaymentMethod>>;
     /// Every method with its owning account resolved, for method-only selects.
     async fn list_with_accounts(&self) -> AppResult<Vec<PaymentMethodWithAccount>>;
-    /// Assign a method to an account, or unassign it with `None`. Unknown
-    /// method ids 404; unknown accounts 404 via the FK; assigning a name the
-    /// account already owns 409 via UNIQUE(account_id, name). `actor` is the
-    /// audit actor: the reassignment (including an unassign) is an edit the
-    /// audit records.
+    /// Move a method to `account_id`. Unknown method ids 404; unknown accounts
+    /// 404 via the FK; a name the target account already owns is a 409 via
+    /// UNIQUE(account_id, name). `actor` is the audit actor the move records.
+    ///
+    /// The parameter is `i64` and not `Option<i64>` because migration 45 made
+    /// `account_id` NOT NULL: an unowned method is no longer a state this schema
+    /// can hold, so it is not a state this type offers. "Take a method out of
+    /// service" is [`Self::set_active`], which keeps the owner and makes the
+    /// method unusable — the two facts an operator actually needs to distinguish
+    /// (still owned here, or gone from this account) stay separate columns
+    /// instead of collapsing into one NULL.
     async fn set_method_account(
         &self,
         actor: i64,
         method_id: i64,
-        account_id: Option<i64>,
+        account_id: i64,
     ) -> AppResult<()>;
+    /// Turn a method selectable (`true`) or not (`false`). This is what "remove a
+    /// method from an account" means: the owner is kept, because the stored
+    /// account is the historical fact of where a payment went (a refund reads it
+    /// back), while `is_active` is the switch `resolve_account_for` checks before
+    /// a method can be chosen. Unknown ids 404.
+    async fn set_active(&self, actor: i64, method_id: i64, active: bool) -> AppResult<()>;
     /// Create a fresh method row owned by `account_id` (duplicates of a
     /// same-named method on another account are allowed by design).
     async fn create_in_account(
@@ -111,7 +121,13 @@ pub trait PaymentMethodRepository: Send + Sync {
         name: &str,
         account_id: i64,
     ) -> AppResult<PaymentMethod>;
-    /// Account ids with no owned methods (self-diagnosing UI warning).
+    /// Account ids with no ACTIVE method (self-diagnosing UI warning).
+    ///
+    /// "Active" and not "has a row": since migration 45 an unticked method is
+    /// deactivated rather than unowned, so an account whose every method was
+    /// unticked still HAS rows while being exactly the account this warning is
+    /// about — one that cannot record a payment. Counting rows here would have
+    /// silenced the warning at the moment it became true.
     async fn list_accounts_without_methods(&self) -> AppResult<Vec<i64>>;
 }
 
@@ -233,14 +249,6 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
         Ok(row.map(row_to_method))
     }
 
-    async fn find_unassigned_by_name(&self, name: &str) -> AppResult<Option<PaymentMethod>> {
-        let row = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at, updated_at FROM payment_methods WHERE account_id IS NULL AND name = ? ORDER BY id LIMIT 1"#)
-        .bind(name)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(row.map(row_to_method))
-    }
-
     async fn list_by_account(&self, account_id: i64) -> AppResult<Vec<PaymentMethod>> {
         let rows = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at, updated_at FROM payment_methods WHERE account_id = ? ORDER BY id"#)
         .bind(account_id)
@@ -249,18 +257,13 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
         Ok(rows.into_iter().map(row_to_method).collect())
     }
 
-    async fn list_unassigned(&self) -> AppResult<Vec<PaymentMethod>> {
-        let rows = sqlx::query(r#"SELECT id, name, account_id, is_active, created_by, updated_by, created_at, updated_at FROM payment_methods WHERE account_id IS NULL ORDER BY id"#)
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(rows.into_iter().map(row_to_method).collect())
-    }
-
     async fn list_with_accounts(&self) -> AppResult<Vec<PaymentMethodWithAccount>> {
+        // INNER JOIN, not LEFT: `account_id` is NOT NULL and a FK to `accounts`,
+        // so there is no method row without an owner for a LEFT JOIN to keep.
         let rows = sqlx::query(
             r#"SELECT m.id, m.name, m.account_id, a.name AS account_name, m.is_active
                FROM payment_methods m
-               LEFT JOIN accounts a ON a.id = m.account_id
+               JOIN accounts a ON a.id = m.account_id
                ORDER BY m.id"#,
         )
         .fetch_all(&self.pool)
@@ -272,7 +275,7 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
         &self,
         actor: i64,
         method_id: i64,
-        account_id: Option<i64>,
+        account_id: i64,
     ) -> AppResult<()> {
         let result = sqlx::query(
             "UPDATE payment_methods
@@ -281,6 +284,25 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
              WHERE id = ?",
         )
         .bind(account_id)
+        .bind(actor)
+        .bind(method_id)
+        .execute(&self.pool)
+        .await
+        .map_err(map_db_err)?;
+        if result.rows_affected() == 0 {
+            return Err(AppError::NotFound(format!("method {method_id} not found")));
+        }
+        Ok(())
+    }
+
+    async fn set_active(&self, actor: i64, method_id: i64, active: bool) -> AppResult<()> {
+        let result = sqlx::query(
+            "UPDATE payment_methods
+             SET is_active = ?, updated_by = ?,
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+             WHERE id = ?",
+        )
+        .bind(if active { 1_i64 } else { 0_i64 })
         .bind(actor)
         .bind(method_id)
         .execute(&self.pool)
@@ -314,7 +336,8 @@ impl PaymentMethodRepository for SqlitePaymentMethodRepository {
         let rows: Vec<(i64,)> = sqlx::query_as(
             r#"SELECT a.id FROM accounts a
                WHERE NOT EXISTS (
-                   SELECT 1 FROM payment_methods pm WHERE pm.account_id = a.id
+                   SELECT 1 FROM payment_methods pm
+                    WHERE pm.account_id = a.id AND pm.is_active = 1
                ) ORDER BY a.id"#,
         )
         .fetch_all(&self.pool)
@@ -461,6 +484,13 @@ mod tests {
         .unwrap();
     }
 
+    /// `apply_migration_file` lands migrations 24 and 30 only, so this fixture
+    /// is still the PRE-45 shape: `payment_methods` carries no `account_id`
+    /// column and the allowlist is out of reach. It therefore seeds its own
+    /// account and a method owned by it, because the module under test reads
+    /// ownership from a column that does not exist here and a test that reached
+    /// `list_unassigned` (a read migration 45 deleted) would be asserting a
+    /// shape the product no longer has.
     #[tokio::test]
     async fn migration_splits_shared_methods_keeps_ids_and_drops_allowlist() {
         let pool = pre_migration_pool().await;
@@ -537,17 +567,12 @@ mod tests {
             .unwrap_err();
         assert!(gone.to_string().contains("no such table"), "got {gone}");
 
-        // Account-scoped reads see the split.
+        // Account-scoped reads see the split. `Orphan` is the pre-45 allowance
+        // this fixture's own migrations leave behind: it survives here because
+        // migration 45 is deliberately not applied, and the repository only
+        // ever lists by an account it is given.
         let a_methods = repo.list_by_account(a.0).await.unwrap();
         assert_eq!(a_methods.len(), 2);
-        let unassigned = repo.list_unassigned().await.unwrap();
-        assert_eq!(
-            unassigned
-                .iter()
-                .map(|m| m.name.clone())
-                .collect::<Vec<_>>(),
-            vec!["Orphan"]
-        );
         assert!(repo
             .list_accounts_without_methods()
             .await
@@ -556,7 +581,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_method_account_assigns_unassigns_and_rejects_unknowns() {
+    async fn set_method_account_moves_between_accounts_and_rejects_unknowns() {
         let pool = migrated_pool().await;
         let repo = SqlitePaymentMethodRepository::new(pool.clone());
         // The fixture account is system-planted data: the actor is the
@@ -568,34 +593,80 @@ mod tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        // Seeded methods are unassigned on a fresh DB.
-        let cash = repo.find_method_by_name("Cash").await.unwrap().unwrap();
-        assert_eq!(cash.account_id, None);
+        let other: (i64,) =
+            sqlx::query_as("INSERT INTO accounts (name, created_by) VALUES ('B', ?) RETURNING id")
+                .bind(actor)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // Migration 45 seeds Cash owned by Caja, so a fresh database has no
+        // method to move and this test creates one to have a subject.
+        let cash = repo
+            .create_in_account(actor, "Movable", acc.0)
+            .await
+            .unwrap();
+        assert_eq!(cash.account_id, acc.0);
 
-        repo.set_method_account(audit_actor(&repo).await, cash.id, Some(acc.0))
+        repo.set_method_account(actor, cash.id, other.0)
             .await
             .unwrap();
         assert_eq!(
             repo.find_method(cash.id).await.unwrap().unwrap().account_id,
-            Some(acc.0)
+            other.0
         );
-        repo.set_method_account(audit_actor(&repo).await, cash.id, None)
+
+        // The same name twice in one account is a conflict, not a second row.
+        repo.create_in_account(actor, "Movable", acc.0)
             .await
             .unwrap();
-        assert_eq!(
-            repo.find_method(cash.id).await.unwrap().unwrap().account_id,
-            None
-        );
+        let clash = repo
+            .set_method_account(actor, cash.id, acc.0)
+            .await
+            .unwrap_err();
+        assert!(matches!(clash, AppError::Conflict(_)), "got {clash:?}");
 
         let err = repo
-            .set_method_account(audit_actor(&repo).await, 999_999, Some(acc.0))
+            .set_method_account(actor, 999_999, acc.0)
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
         let err = repo
-            .set_method_account(audit_actor(&repo).await, cash.id, Some(999_999))
+            .set_method_account(actor, cash.id, 999_999)
             .await
             .unwrap_err();
+        assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
+        assert_eq!(
+            repo.find_method(cash.id).await.unwrap().unwrap().account_id,
+            other.0,
+            "a refused move must leave the owner where it was"
+        );
+    }
+
+    /// Migration 45 turned "take a method out of service" into `set_active`: the
+    /// owner survives, because the stored account is the historical fact a
+    /// refund reads back, and only the selectability flips.
+    #[tokio::test]
+    async fn set_active_deactivates_and_reactivates_without_touching_the_owner() {
+        let pool = migrated_pool().await;
+        let repo = SqlitePaymentMethodRepository::new(pool.clone());
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let caja: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE name = 'Caja'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let cash = repo.find_method_by_name("Cash").await.unwrap().unwrap();
+        assert_eq!(cash.account_id, caja);
+
+        repo.set_active(actor, cash.id, false).await.unwrap();
+        let off = repo.find_method(cash.id).await.unwrap().unwrap();
+        assert!(!off.is_active, "deactivation must land");
+        assert_eq!(off.account_id, caja, "deactivation must keep the owner");
+        assert_eq!(off.updated_by, Some(actor), "the change is attributed");
+
+        repo.set_active(actor, cash.id, true).await.unwrap();
+        assert!(repo.find_method(cash.id).await.unwrap().unwrap().is_active);
+
+        let err = repo.set_active(actor, 999_999, false).await.unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)), "got {err:?}");
     }
 
@@ -647,10 +718,10 @@ mod tests {
 
     /// `find_method_in` must answer from the connection it was HANDED, and the
     /// two fields it must see move are the two `resolve_account_for` branches
-    /// on: `account_id` (assigned vs unassigned) and `is_active`
-    /// (`finance_methods.rs:228-243`). A read that answered from a snapshot
-    /// would hand the Cash path a different DECISION than the one the
-    /// transaction has already committed to.
+    /// on: `account_id` (this account vs another) and `is_active`
+    /// (`finance_methods.rs`). A read that answered from a snapshot would hand
+    /// the Cash path a different DECISION than the one the transaction has
+    /// already committed to.
     ///
     /// The fixture is the file's own `migrated_pool()`, so `max_connections(1)`
     /// — the lever the next test needs — is inherited rather than restated.
@@ -660,12 +731,18 @@ mod tests {
         let repo = SqlitePaymentMethodRepository::new(pool.clone());
         let actor = audit_actor(&repo).await;
         let acc = seed_account(&repo, "PM-PH-A Cash", actor).await;
-        // Seeded methods are unassigned and active on a fresh DB.
+        // Migration 45 seeds Cash owned by Caja and active; this fixture starts
+        // by moving it to ITS account, so "the unit changed the owner" has an
+        // owner to change away from and back to.
         let cash = repo.find_method_by_name("Cash").await.unwrap().unwrap();
-        assert_eq!(
-            (cash.account_id, cash.is_active),
-            (None, true),
-            "the fixture must start with the method unassigned and active, or this test proves nothing"
+        let caja = cash.account_id;
+        assert!(
+            cash.is_active,
+            "the fixture must start active, or this test proves nothing"
+        );
+        assert_ne!(
+            caja, acc,
+            "the fixture account must differ from the seeded one"
         );
 
         let mut tx = pool.begin().await.unwrap();
@@ -694,7 +771,7 @@ mod tests {
             .unwrap()
             .expect("the row this transaction created is invisible to it");
         assert_eq!(seen_inserted.name, "Created Inside");
-        assert_eq!(seen_inserted.account_id, Some(acc));
+        assert_eq!(seen_inserted.account_id, acc);
         assert!(seen_inserted.is_active);
 
         let seen_update = repo
@@ -703,8 +780,7 @@ mod tests {
             .unwrap()
             .expect("the row this transaction changed is invisible to it");
         assert_eq!(
-            seen_update.account_id,
-            Some(acc),
+            seen_update.account_id, acc,
             "the read did not see the caller's own uncommitted writes, so it would resolve the Cash account from a different moment than the one the transaction holds"
         );
         assert!(
@@ -731,7 +807,7 @@ mod tests {
         let restored = repo.find_method(cash.id).await.unwrap().unwrap();
         assert_eq!(
             (restored.account_id, restored.is_active),
-            (None, true),
+            (caja, true),
             "the reassignment or the deactivation survived a rollback of the transaction that made it"
         );
     }
@@ -753,9 +829,7 @@ mod tests {
         let actor = audit_actor(&repo).await;
         let acc = seed_account(&repo, "PM-PH-B Cash", actor).await;
         let cash = repo.find_method_by_name("Cash").await.unwrap().unwrap();
-        repo.set_method_account(actor, cash.id, Some(acc))
-            .await
-            .unwrap();
+        repo.set_method_account(actor, cash.id, acc).await.unwrap();
 
         let mut tx = pool.begin().await.unwrap();
         // The premise, asserted rather than assumed: the pool cannot serve a
@@ -782,7 +856,7 @@ mod tests {
             "find_method_in took {elapsed:?}; that is a read stalling for a connection, not one on the connection it was handed"
         );
         assert_eq!(found.name, "Cash");
-        assert_eq!(found.account_id, Some(acc));
+        assert_eq!(found.account_id, acc);
         // The caller's transaction is still ALIVE and still holds its lock: a
         // second statement on the same connection answers. A `find_method_in`
         // that had ended, committed or rolled back the unit it was given could
@@ -806,40 +880,39 @@ mod tests {
 
     /// The additive claim, proved rather than asserted: the public `find_method`
     /// still answers exactly what it always answered, in every branch its callers
-    /// actually distinguish. `resolve_account_for` (`finance_methods.rs:228-243`)
-    /// draws THREE outcomes from this one read — unknown id becomes `NotFound`,
-    /// `!is_active` becomes a `Validation`, and `account_id = None` becomes a
-    /// different `Validation` naming the fix — so a rewrite that collapsed any
-    /// two of them into one would change a refusal a Cash document can receive.
-    /// The three are asserted as the raw VALUES the service branches on, because
-    /// calling `services::finance_methods` from a `repositories/` test module
-    /// would import `services::` downward and invert the layering rule.
+    /// actually distinguish. `resolve_account_for` (`finance_methods.rs`) draws
+    /// TWO outcomes from this one read — unknown id becomes `NotFound`, and
+    /// `!is_active` becomes a `Validation` — plus the owner it returns on
+    /// success. Migration 45 removed the third (unassigned) branch; the test
+    /// below pins that a refusal is a VALUE the read reports, not a row it
+    /// filters away.
     #[tokio::test]
-    async fn the_public_find_method_answers_exactly_as_before_including_the_unassigned_method() {
+    async fn the_public_find_method_answers_every_value_the_service_branches_on() {
         let pool = migrated_pool().await;
         let repo = SqlitePaymentMethodRepository::new(pool.clone());
         let actor = audit_actor(&repo).await;
         let acc = seed_account(&repo, "PM-PH-C Cash", actor).await;
         let cash = repo.find_method_by_name("Cash").await.unwrap().unwrap();
-        let transfer = repo.find_method_by_name("Transfer").await.unwrap().unwrap();
-
-        // UNASSIGNED is a value, not an error: the method row exists, so this is
-        // `Ok(Some(..))` carrying `account_id = None`, which is the "method not
-        // assigned" case and is NOT the same answer as the unknown-id case.
-        let unassigned = repo.find_method(cash.id).await.unwrap().unwrap();
-        assert_eq!(unassigned.name, "Cash");
-        assert_eq!(unassigned.account_id, None);
-        assert!(unassigned.is_active);
-        assert_eq!(unassigned.created_by, actor);
-
-        // The same row once assigned: the wrapper's own unit is invisible, so
-        // the read is correct immediately after it.
-        repo.set_method_account(actor, cash.id, Some(acc))
+        // A SECOND method of the same database: migration 45 deleted the
+        // history-less `Transfer`, so the fixture creates the second subject the
+        // way the product does.
+        let other = repo
+            .create_in_account(actor, "Transfer", acc)
             .await
             .unwrap();
-        let assigned = repo.find_method(cash.id).await.unwrap().unwrap();
-        assert_eq!(assigned.account_id, Some(acc));
-        assert_eq!(assigned.name, "Cash");
+
+        // The seeded owner is itself a value the read reports.
+        let seeded = repo.find_method(cash.id).await.unwrap().unwrap();
+        assert_eq!(seeded.name, "Cash");
+        assert!(seeded.account_id > 0);
+        assert!(seeded.is_active);
+
+        // A move lands immediately: the wrapper's own unit is invisible, so the
+        // read is correct right after it.
+        repo.set_method_account(actor, cash.id, acc).await.unwrap();
+        let moved = repo.find_method(cash.id).await.unwrap().unwrap();
+        assert_eq!(moved.account_id, acc);
+        assert_eq!(moved.name, "Cash");
 
         // Deactivated is a THIRD value: the read does not filter, so `is_active`
         // reaches the service as `false` rather than as a missing row.
@@ -854,15 +927,14 @@ mod tests {
             "the read filtered the deactivated method out instead of reporting it"
         );
         assert_eq!(
-            inactive.account_id,
-            Some(acc),
+            inactive.account_id, acc,
             "the wrapper lost the ownership it had committed a moment earlier"
         );
 
         // Per id, not "is the table non-empty": a wrapper that dropped its bind
         // would answer the second read with the first.
         assert_eq!(
-            repo.find_method(transfer.id).await.unwrap().unwrap().name,
+            repo.find_method(other.id).await.unwrap().unwrap().name,
             "Transfer"
         );
         // The unknown-id branch is a VALUE, not an error — and it stays one.
@@ -871,7 +943,7 @@ mod tests {
         // And the wrapper leaves no unit behind: it is answerable again
         // immediately, and the row it read is still the row it found.
         let again = repo.find_method(cash.id).await.unwrap().unwrap();
-        assert_eq!(again.account_id, Some(acc));
+        assert_eq!(again.account_id, acc);
         assert!(!again.is_active);
     }
 }

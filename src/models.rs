@@ -801,6 +801,15 @@ pub struct TransactionsResponse {
 #[derive(Debug, Deserialize)]
 pub struct CreateAccountRequest {
     pub name: String,
+    /// Methods to tick for the new account, the same way the web form does.
+    ///
+    /// Absent means "just the defaults this account's NAME implies" (`Caja` gets
+    /// `Cash`), which is what a caller that only wants an account should get.
+    /// Present means the operator named them: an id owned by another account is
+    /// DUPLICATED into this one, never stolen, and a method the name already
+    /// brought is simply kept — the tick and the default are the same intent.
+    #[serde(default)]
+    pub method_ids: Vec<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1443,10 +1452,12 @@ pub struct SalePayment {
 pub struct PaymentMethod {
     pub id: i64,
     pub name: String,
-    /// The owning account; NULL means unassigned and unusable for payments.
-    pub account_id: Option<i64>,
+    /// The owning account. Not `Option`: migration 45 made the column NOT NULL,
+    /// so an unowned method is not a state this schema can hold. A method taken
+    /// out of service keeps this owner and flips `is_active`.
+    pub account_id: i64,
     pub is_active: bool,
-    /// Audit actor (M5 Phase B): who created and who last reassigned the method.
+    /// Audit actor (M5 Phase B): who created and who last changed the method.
     pub created_by: i64,
     pub updated_by: Option<i64>,
     pub created_at: chrono::NaiveDateTime,
@@ -1487,22 +1498,21 @@ pub struct AccountMethodsResponse {
 pub struct PaymentMethodWithAccount {
     pub id: i64,
     pub name: String,
-    pub account_id: Option<i64>,
-    pub account_name: Option<String>,
+    pub account_id: i64,
+    pub account_name: String,
     pub is_active: bool,
 }
 
 impl PaymentMethodWithAccount {
-    /// Owning account name, or `unassigned` for methods no account owns yet.
-    pub fn account_label(&self) -> String {
-        self.account_name
-            .clone()
-            .unwrap_or_else(|| "unassigned".to_string())
-    }
-
     /// Select label: `"Transfer — Bank"`.
+    ///
+    /// One method, not two: `account_name` is `NOT NULL` (migration 45 made the
+    /// foreign key mandatory and the read an INNER join), so a separate
+    /// `account_label()` had exactly one caller and returned a clone of the field
+    /// it was given. It was the site of the old `unassigned` fallback, which no
+    /// row can reach any more.
     pub fn label(&self) -> String {
-        format!("{} — {}", self.name, self.account_label())
+        format!("{} — {}", self.name, self.account_name)
     }
 }
 
@@ -2889,10 +2899,23 @@ pub struct NewReceipt {
 pub struct ReceiptDetail {
     pub receipt: CustomerReceipt,
     pub allocations: Vec<SalePayment>,
-    /// Derived, never stored: `SUM(allocations.amount)`, i.e. exactly what was
-    /// handed over and applied. A stored copy could disagree with the payments;
-    /// this one is computed from them.
+    /// **What was actually handed over**: `SUM(amount)` of the deliveries this receipt
+    /// groups (migration 47's `payments.receipt_id`).
+    ///
+    /// A1: this field's MEANING changed in P3c. It used to be the sum of the
+    /// allocations, which is what was APPLIED — and those two numbers diverge the
+    /// moment a collection delivers more than the outstanding debt, because the excess
+    /// is applied to nothing and therefore appears in no allocation. A receipt that
+    /// reported 30 while the box received 50 was not a display bug, it was the receipt
+    /// being unable to see money it had grouped.
     pub total: Decimal,
+    /// What those deliveries were APPLIED to: `SUM(allocations.amount)`. Always
+    /// `<= total`.
+    pub applied: Decimal,
+    /// The credit this collection created and did not apply: `total - applied`. Never
+    /// stored, and not a separate pliegue — it is the difference between the two
+    /// numbers above, both of which come from tables that already exist.
+    pub unapplied: Decimal,
     /// Account name resolved for display through the account read path.
     pub account_name: String,
     /// Payment-method name resolved for display through the finance read path.
@@ -3118,12 +3141,31 @@ pub struct RoleMatrix {
 }
 
 impl ReceiptDetail {
-    pub fn new(receipt: CustomerReceipt, allocations: Vec<SalePayment>) -> Self {
-        let total = allocations.iter().map(|payment| payment.amount).sum();
+    /// Assemble from the two facts the receipt now knows: what its DELIVERIES brought
+    /// in (`received`) and what its allocations applied.
+    ///
+    /// `received` is passed in rather than derived from the allocations because it
+    /// cannot be: the unapplied remainder belongs to the delivery and appears in no
+    /// allocation. `applied` IS derived, from the same rows that have always carried
+    /// it, so there is still exactly one source for it.
+    pub fn new(receipt: CustomerReceipt, allocations: Vec<SalePayment>, received: Decimal) -> Self {
+        let applied = allocations
+            .iter()
+            .fold(Decimal::ZERO, |sum, payment| sum + payment.amount);
+        // `received - applied` is the credit. A negative would mean an allocation with
+        // no delivery behind it, which the cap makes unrepresentable; saturating at zero
+        // keeps the field honest instead of printing a negative to an operator.
+        let unapplied = if received > applied {
+            received - applied
+        } else {
+            Decimal::ZERO
+        };
         Self {
             receipt,
             allocations,
-            total,
+            total: received,
+            applied,
+            unapplied,
             account_name: String::new(),
             method_name: String::new(),
         }
@@ -3368,7 +3410,6 @@ pub struct PurchaseReturnPayment {
 pub struct PurchaseReturnDetail {
     pub purchase_return: PurchaseReturn,
     pub lines: Vec<PurchaseReturnLine>,
-    pub payments: Vec<PurchaseReturnPayment>,
     /// `sum(line.subtotal())` — the money before tax, which here is all of it.
     pub net_subtotal: Decimal,
     /// The document total: the tax-inclusive figure, and with no frozen tax on a
@@ -3497,7 +3538,6 @@ pub struct CustomerReturnPayment {
 pub struct CustomerReturnDetail {
     pub customer_return: CustomerReturn,
     pub lines: Vec<CustomerReturnLine>,
-    pub payments: Vec<CustomerReturnPayment>,
     /// `sum(line.subtotal())` — the money before tax, which here is all of it.
     pub net_subtotal: Decimal,
     /// The document total: the tax-inclusive figure, and with no frozen tax on a
@@ -3527,6 +3567,326 @@ pub fn format_purchase_return_number(year: i32, seq: i64) -> String {
 /// and the same rule that `year` is the return's own date year.
 pub fn format_customer_return_number(year: i32, seq: i64) -> String {
     format!("{year}-SRET-{seq:06}")
+}
+
+// ---------------------------------------------------------------------------
+// Party ledger — one signed entry table per party
+// (odd/tasks/party-ledger.md, decisions 1, 3, 7)
+// ---------------------------------------------------------------------------
+
+/// Whose ledger an entry belongs to. The value pairs with `party_id`, which
+/// carries no foreign key precisely because it means one of two tables
+/// depending on this field (migration 42).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
+#[sqlx(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum PartyType {
+    Customer,
+    Supplier,
+}
+
+impl std::fmt::Display for PartyType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Customer => write!(f, "Customer"),
+            Self::Supplier => write!(f, "Supplier"),
+        }
+    }
+}
+
+impl std::str::FromStr for PartyType {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "customer" => Ok(Self::Customer),
+            "supplier" => Ok(Self::Supplier),
+            _ => Err(format!("invalid party type: {s}")),
+        }
+    }
+}
+
+/// What happened, as the journal records it. The five events of decision 1's
+/// table; a row's `kind` and its stored SIGN together are the whole statement
+/// of that rule, so a reader never has to re-derive a direction from context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
+#[sqlx(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum PartyEntryKind {
+    Charge,
+    Payment,
+    Return,
+    Refund,
+    Cancel,
+}
+
+impl PartyEntryKind {
+    /// THE SIGN RULE of decision 1, in one place so no write path can hold a
+    /// second opinion about it:
+    ///
+    /// | event | kind | sign |
+    /// |---|---|---|
+    /// | document confirmed (cash or credit) | `Charge` | `+total` |
+    /// | cash settled against the document | `Payment` | `−amount` |
+    /// | goods returned / credit note | `Return` | `−total` |
+    /// | cash handed back to the party | `Refund` | `+amount` |
+    /// | whole document annulled | `Cancel` | `−total` |
+    ///
+    /// The argument is the magnitude as the document states it — a total or a
+    /// payment amount, i.e. a figure that is already non-negative on a
+    /// well-formed document. The returned value is what gets STORED: the sign
+    /// lives in the row, and the read side is one checked sum over `amount`,
+    /// never a sign function of its own.
+    ///
+    /// Worked examples the feature document pins: a customer who owes 200 and
+    /// pays 250 folds to `−50` (a credit); a 100 credit note returned in full
+    /// before any payment folds to `+100 −100 = 0`.
+    pub fn signed_amount(self, magnitude: Decimal) -> Decimal {
+        match self {
+            Self::Charge | Self::Refund => magnitude,
+            Self::Payment | Self::Return | Self::Cancel => -magnitude,
+        }
+    }
+}
+
+impl std::fmt::Display for PartyEntryKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Charge => write!(f, "Charge"),
+            Self::Payment => write!(f, "Payment"),
+            Self::Return => write!(f, "Return"),
+            Self::Refund => write!(f, "Refund"),
+            Self::Cancel => write!(f, "Cancel"),
+        }
+    }
+}
+
+impl std::str::FromStr for PartyEntryKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "charge" => Ok(Self::Charge),
+            "payment" => Ok(Self::Payment),
+            "return" => Ok(Self::Return),
+            "refund" => Ok(Self::Refund),
+            "cancel" => Ok(Self::Cancel),
+            _ => Err(format!("invalid party entry kind: {s}")),
+        }
+    }
+}
+
+/// The family of the document an entry points at. The pair (kind, id) is the
+/// reference — document families plus receipts, one column set, so it cannot
+/// be a foreign key (migration 42's header says why that is a property of SQLite
+/// and not a shortcut).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
+#[sqlx(type_name = "TEXT")]
+#[sqlx(rename_all = "PascalCase")]
+#[serde(rename_all = "PascalCase")]
+pub enum PartyDocumentKind {
+    Sale,
+    Purchase,
+    CustomerReturn,
+    PurchaseReturn,
+    CustomerReceipt,
+}
+
+impl std::fmt::Display for PartyDocumentKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Sale => write!(f, "Sale"),
+            Self::Purchase => write!(f, "Purchase"),
+            Self::CustomerReturn => write!(f, "CustomerReturn"),
+            Self::PurchaseReturn => write!(f, "PurchaseReturn"),
+            Self::CustomerReceipt => write!(f, "CustomerReceipt"),
+        }
+    }
+}
+
+impl std::str::FromStr for PartyDocumentKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "sale" => Ok(Self::Sale),
+            "purchase" => Ok(Self::Purchase),
+            "customerreturn" => Ok(Self::CustomerReturn),
+            "purchasereturn" => Ok(Self::PurchaseReturn),
+            "customerreceipt" => Ok(Self::CustomerReceipt),
+            _ => Err(format!("invalid party document kind: {s}")),
+        }
+    }
+}
+
+/// One stored ledger row.
+///
+/// `amount` is the SIGNED figure — positive is an outstanding obligation,
+/// negative is a saldo a favor (see [`PartyEntryKind::signed_amount`]) — and it
+/// is what every balance folds, so nothing downstream re-applies a sign.
+/// `entry_date` is the event's date as its document wrote it.
+///
+/// The journal is append-only (decisions 3 and 10): a cancel appends its own
+/// entries rather than editing the ones that exist, and the schema itself
+/// refuses every `UPDATE` and `DELETE` on the table, so there is no audit
+/// stamp beyond `created_by`/`created_at` to drift from what happened.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PartyLedgerEntry {
+    pub id: i64,
+    pub party_type: PartyType,
+    pub party_id: i64,
+    pub kind: PartyEntryKind,
+    /// Signed Decimal, stored as TEXT. Never `f32`/`f64`.
+    pub amount: Decimal,
+    pub document_kind: PartyDocumentKind,
+    pub document_id: i64,
+    pub entry_date: NaiveDate,
+    /// The document number, opaque: the ledger never parses it.
+    pub reference: Option<String>,
+    pub created_by: i64,
+    pub created_at: chrono::NaiveDateTime,
+}
+
+/// Which way the money moved. `In` is received (a customer collection), `Out` is
+/// handed over (a supplier payment, or a refund to a customer).
+///
+/// A closed enum rather than a `String` because the schema carries a CHECK for the
+/// same two values: the type and the database cannot disagree, and a third
+/// direction would have to be added in both places on purpose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaymentDirection {
+    In,
+    Out,
+}
+
+impl PaymentDirection {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::In => "In",
+            Self::Out => "Out",
+        }
+    }
+}
+
+impl std::str::FromStr for PaymentDirection {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "In" => Ok(Self::In),
+            "Out" => Ok(Self::Out),
+            other => Err(format!("unknown payment direction: {other}")),
+        }
+    }
+}
+
+/// One document per DELIVERY of money (migration 46, decision 1): a collection, a
+/// transfer covering several invoices, a cheque, a supplier payment, a refund.
+///
+/// `transaction_id` is the single cash movement (decision 5). Allocations live in
+/// their own table and carry no account, no method and no transaction, because the
+/// money moved when it arrived and applying it later is only an allocation — which
+/// is what lets an applied credit be represented without inventing a movement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Payment {
+    pub id: i64,
+    pub number: String,
+    pub direction: PaymentDirection,
+    pub party_type: PartyType,
+    pub party_id: i64,
+    pub method_id: i64,
+    pub account_id: i64,
+    pub amount: Decimal,
+    pub date: NaiveDate,
+    pub notes: Option<String>,
+    pub transaction_id: Option<i64>,
+    /// The receipt that groups this delivery, when a lump-sum collection produced it
+    /// (migration 47). NULL for a direct payment on one sale.
+    ///
+    /// It lives on the DELIVERY and not on each allocation on purpose: the receipt
+    /// groups the HANDOVER of money, while the allocations say which documents that
+    /// money covered. Two facts, two places.
+    pub receipt_id: Option<i64>,
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+/// The input for one payment write. `amount` is a magnitude: the direction says
+/// which way it went, so no sign is ever stored on it.
+///
+/// `number` arrives from the CALLER rather than being generated by the insert,
+/// for the same reason `sale_number` does: a caller inside a unit takes it with
+/// `doc_sequences::next_number_in`, so a confirmation that rolls back returns the
+/// number instead of burning it, and a retry takes the first one.
+#[derive(Debug, Clone)]
+pub struct NewPayment {
+    pub number: String,
+    pub direction: PaymentDirection,
+    pub party_type: PartyType,
+    pub party_id: i64,
+    pub method_id: i64,
+    pub account_id: i64,
+    pub amount: Decimal,
+    pub date: NaiveDate,
+    pub notes: Option<String>,
+    pub transaction_id: Option<i64>,
+    /// The receipt this delivery is grouped under, or `None` for a direct payment.
+    pub receipt_id: Option<i64>,
+    pub created_by: i64,
+}
+
+/// One share of a payment, pointing at the document it covers.
+///
+/// `target_kind` is a `PartyDocumentKind` because the set of allocatable documents
+/// IS the set of documents a party can owe or be owed for — a second enum would be
+/// the same list with different names, and the two could drift.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaymentAllocation {
+    pub id: i64,
+    pub payment_id: i64,
+    pub target_kind: PartyDocumentKind,
+    pub target_id: i64,
+    pub amount: Decimal,
+    pub created_by: i64,
+    pub updated_by: Option<i64>,
+    pub created_at: chrono::NaiveDateTime,
+    pub updated_at: chrono::NaiveDateTime,
+}
+
+#[derive(Debug, Clone)]
+pub struct NewPaymentAllocation {
+    pub payment_id: i64,
+    pub target_kind: PartyDocumentKind,
+    pub target_id: i64,
+    pub amount: Decimal,
+    pub created_by: i64,
+}
+
+/// Format `YYYY-PAY-NNNNNN`, the payment's twin of [`format_sale_number`]: same
+/// width, same zero padding, and the same no-gap sequence behind it.
+pub fn format_payment_number(year: i32, seq: i64) -> String {
+    format!("{year}-PAY-{seq:06}")
+}
+
+/// The write shape of [`PartyLedgerEntry`], without the row's identity or its
+/// DB-stamped `created_at`.
+///
+/// `amount` arrives already signed — the caller states the magnitude through
+/// [`PartyEntryKind::signed_amount`] — so the column is written exactly once,
+/// here, and there is no second place where a direction could be applied.
+#[derive(Debug, Clone)]
+pub struct NewPartyLedgerEntry {
+    pub party_type: PartyType,
+    pub party_id: i64,
+    pub kind: PartyEntryKind,
+    /// Signed Decimal, stored as TEXT.
+    pub amount: Decimal,
+    pub document_kind: PartyDocumentKind,
+    pub document_id: i64,
+    pub entry_date: NaiveDate,
+    pub reference: Option<String>,
+    pub created_by: i64,
 }
 
 #[cfg(test)]
@@ -4024,7 +4384,6 @@ mod tests {
         let draft = PurchaseReturnDetail {
             purchase_return: purchase_return(PurchaseReturnStatus::Draft, None),
             lines: vec![purchase_return_line("3", "2.50")],
-            payments: vec![],
             net_subtotal: dec("7.50"),
             total: dec("7.50"),
             paid: dec("0"),
@@ -4037,7 +4396,6 @@ mod tests {
         assert_eq!(draft.purchase_return.return_number, None);
         assert_eq!(draft.purchase_return.purchase_id, 9);
         assert_eq!(draft.lines.len(), 1);
-        assert_eq!(draft.payments.len(), 0);
 
         // A return line freezes no tax, so there is nothing to separate: net and
         // total are the same figure, and both are the line's own subtotal.
@@ -4050,7 +4408,6 @@ mod tests {
                 PurchaseReturnStatus::Confirmed,
                 Some("2026-PRET-000001"),
             ),
-            payments: vec![purchase_return_payment(Some(31), None)],
             paid: dec("7.50"),
             due: dec("0"),
             payment_status: PaymentStatus::Paid,
@@ -4060,7 +4417,6 @@ mod tests {
             confirmed.purchase_return.return_number.as_deref(),
             Some("2026-PRET-000001")
         );
-        assert_eq!(confirmed.payments[0].transaction_id, Some(31));
         assert_eq!(confirmed.due, Decimal::ZERO);
     }
 
@@ -4074,7 +4430,6 @@ mod tests {
         let draft = CustomerReturnDetail {
             customer_return: customer_return(CustomerReturnStatus::Draft, None),
             lines: vec![customer_return_line("3", "2.50")],
-            payments: vec![],
             net_subtotal: dec("7.50"),
             total: dec("7.50"),
             paid: dec("0"),
@@ -4085,7 +4440,6 @@ mod tests {
         assert_eq!(draft.customer_return.credit_note_number, None);
         assert_eq!(draft.customer_return.sale_id, 9);
         assert_eq!(draft.lines.len(), 1);
-        assert_eq!(draft.payments.len(), 0);
         assert_eq!(draft.net_subtotal, draft.total);
         assert_eq!(draft.total, draft.lines[0].subtotal());
         assert_eq!(draft.due, draft.total - draft.paid);
@@ -4095,7 +4449,6 @@ mod tests {
                 CustomerReturnStatus::Confirmed,
                 Some("2026-SRET-000001"),
             ),
-            payments: vec![customer_return_payment(Some(31), None)],
             paid: dec("7.50"),
             due: dec("0"),
             payment_status: PaymentStatus::Paid,
@@ -4105,7 +4458,6 @@ mod tests {
             confirmed.customer_return.credit_note_number.as_deref(),
             Some("2026-SRET-000001")
         );
-        assert_eq!(confirmed.payments[0].transaction_id, Some(31));
         assert_eq!(confirmed.due, Decimal::ZERO);
     }
 

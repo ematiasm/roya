@@ -409,6 +409,27 @@ pub trait SaleRepository: Send + Sync {
         payment_id: i64,
         refund_transaction_id: i64,
     ) -> AppResult<SalePayment>;
+    /// [`Self::set_payment_refund_transaction`] inside a transaction the CALLER owns.
+    ///
+    /// T3d needs it: a cancellation writes the `Expense`, links it here and flips the
+    /// document to Cancelled, and those three must be ONE unit — otherwise a failure
+    /// between the refund and the cancellation leaves the money gone and the sale still
+    /// Confirmed, which is the defect this whole family of work exists to close.
+    async fn set_payment_refund_transaction_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        payment_id: i64,
+        refund_transaction_id: i64,
+    ) -> AppResult<SalePayment>;
+    /// [`Self::set_cancelled`] inside a transaction the CALLER owns. Same reason.
+    async fn set_cancelled_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+        actor: i64,
+        reason: Option<&str>,
+    ) -> AppResult<Sale>;
     async fn list_payments(&self, sale_id: i64) -> AppResult<Vec<SalePayment>>;
     /// One payment by id — the documents drawer's per-payment read. `None`
     /// for an id that does not exist; the service decides what that means.
@@ -989,7 +1010,21 @@ impl SaleRepository for SqliteSaleRepository {
             .ok_or_else(|| AppError::NotFound(format!("sale {id} not found")))
     }
 
+    /// A transaction of its own, for a caller with no larger unit to offer.
     async fn set_cancelled(&self, id: i64, actor: i64, reason: Option<&str>) -> AppResult<Sale> {
+        let mut tx = self.pool.begin().await?;
+        let cancelled = self.set_cancelled_in(&mut tx, id, actor, reason).await?;
+        tx.commit().await?;
+        Ok(cancelled)
+    }
+
+    async fn set_cancelled_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        id: i64,
+        actor: i64,
+        reason: Option<&str>,
+    ) -> AppResult<Sale> {
         let clean = reason.and_then(|s| {
             let t = s.trim();
             if t.is_empty() {
@@ -1009,7 +1044,7 @@ impl SaleRepository for SqliteSaleRepository {
         .bind(clean)
         .bind(actor)
         .bind(id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_sale(row))
@@ -1230,8 +1265,25 @@ impl SaleRepository for SqliteSaleRepository {
         Ok(row_to_payment(row))
     }
 
+    /// A transaction of its own, for a caller with no larger unit to offer. The SQL
+    /// lives in the `_in` form; this only adds the BEGIN/COMMIT.
     async fn set_payment_refund_transaction(
         &self,
+        actor: i64,
+        payment_id: i64,
+        refund_transaction_id: i64,
+    ) -> AppResult<SalePayment> {
+        let mut tx = self.pool.begin().await?;
+        let linked = self
+            .set_payment_refund_transaction_in(&mut tx, actor, payment_id, refund_transaction_id)
+            .await?;
+        tx.commit().await?;
+        Ok(linked)
+    }
+
+    async fn set_payment_refund_transaction_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
         actor: i64,
         payment_id: i64,
         refund_transaction_id: i64,
@@ -1246,7 +1298,7 @@ impl SaleRepository for SqliteSaleRepository {
         .bind(refund_transaction_id)
         .bind(actor)
         .bind(payment_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_payment(row))
@@ -1525,6 +1577,219 @@ mod tests {
     use chrono::NaiveDate;
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::time::{Duration, Instant};
+
+    // -- migration 44: the (account_id, method_id) pair on a payment row is
+    // guarded by the schema itself, not by caller discipline. Each refusal is
+    // proved with the raw statement and the trigger's own text, in the style of
+    // the role guards: the message asserted is the one the schema wrote.
+
+    /// The message SQLite put on the refused statement: the raw trigger
+    /// refusal, mapped by nothing, so the proof cannot drift from the schema.
+    fn refusal_message(err: sqlx::Error) -> String {
+        match err {
+            sqlx::Error::Database(db) => db.message().to_string(),
+            other => panic!("expected a refused statement, got {other:?}"),
+        }
+    }
+
+    /// One account and one method that account owns, created fresh: the seeded
+    /// methods are unassigned on a new database, so a consistent pair has to be
+    /// built, not picked.
+    async fn owned_pair(pool: &SqlitePool, name: &str) -> (i64, i64) {
+        let actor = test_support::audit_actor_id(pool).await.unwrap();
+        let account: i64 = match sqlx::query_scalar("SELECT id FROM accounts WHERE name = ?")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO accounts (name, created_by) VALUES (?, ?) RETURNING id",
+            )
+            .bind(name)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
+        let method_name = format!("{name} cash");
+        let method: i64 = match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = ? AND account_id = ?",
+        )
+        .bind(&method_name)
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by) VALUES (?, ?, ?) RETURNING id",
+            )
+            .bind(&method_name)
+            .bind(account)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
+        (account, method)
+    }
+
+    /// A method owned by NO account (`payment_methods.account_id IS NULL`):
+    /// the case the `COALESCE(…, -1)` sentinel exists for, since a bare `<>`
+    /// against NULL is NULL and `WHEN NULL` never aborts.
+
+    #[tokio::test]
+    async fn a_sale_payment_pairing_an_account_with_a_foreign_method_is_refused() {
+        let pool = documents_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let sale = seed_sale(&pool, None, "guard buyer", d(2024, 6, 1), actor).await;
+        let (account, _method) = owned_pair(&pool, "wallet one").await;
+        let (_, foreign_method) = owned_pair(&pool, "wallet two").await;
+        let err = sqlx::query(
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, created_by)\n             VALUES (?, ?, ?, '5', '2024-06-01', ?)",
+        )
+        .bind(sale)
+        .bind(account)
+        .bind(foreign_method)
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal_message(err),
+            "the payment method does not belong to the named account"
+        );
+        let (rows,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE sale_id = ?")
+                .bind(sale)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 0, "the refused row is not there");
+    }
+
+    #[tokio::test]
+    async fn a_sale_payment_with_a_consistent_pair_still_inserts() {
+        let pool = documents_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let sale = seed_sale(&pool, None, "guard buyer", d(2024, 6, 1), actor).await;
+        let (account, method) = owned_pair(&pool, "wallet one").await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, created_by)\n             VALUES (?, ?, ?, '5', '2024-06-01', ?) RETURNING id",
+        )
+        .bind(sale)
+        .bind(account)
+        .bind(method)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (stored_account, stored_method): (i64, i64) =
+            sqlx::query_as("SELECT account_id, method_id FROM sale_payments WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (stored_account, stored_method),
+            (account, method),
+            "the consistent pair was written"
+        );
+    }
+
+    /// A method owned by ANOTHER account, which is the pair mismatch migration 44
+    /// exists to refuse. (Before migration 45 the same guard also had to catch an
+    /// owner-less method; `account_id` is NOT NULL now, so the mismatch that is
+    /// still representable is this one.)
+    #[tokio::test]
+    async fn a_sale_payment_naming_a_method_of_another_account_is_refused() {
+        let pool = documents_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let sale = seed_sale(&pool, None, "guard buyer", d(2024, 6, 1), actor).await;
+        let (account, _) = owned_pair(&pool, "wallet one").await;
+        let (_, foreign_method) = owned_pair(&pool, "wallet two").await;
+        let err = sqlx::query(
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, created_by)\n             VALUES (?, ?, ?, '5', '2024-06-01', ?)",
+        )
+        .bind(sale)
+        .bind(account)
+        .bind(foreign_method)
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal_message(err),
+            "the payment method does not belong to the named account",
+            "a pair that names two different accounts must not be writable"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sale_payment_naming_a_method_that_does_not_exist_is_refused() {
+        let pool = documents_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let sale = seed_sale(&pool, None, "guard buyer", d(2024, 6, 1), actor).await;
+        let (account, _) = owned_pair(&pool, "wallet one").await;
+        // A BEFORE trigger fires before constraint checking, so asserting the
+        // trigger's own text proves the sentinel refused it — stronger than the
+        // foreign key, which would have answered with its own message.
+        let err = sqlx::query(
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, created_by)\n             VALUES (?, ?, ?, '5', '2024-06-01', ?)",
+        )
+        .bind(sale)
+        .bind(account)
+        .bind(999_999_i64)
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal_message(err),
+            "the payment method does not belong to the named account"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sale_payment_row_can_diverge_from_its_method_after_insert() {
+        let pool = documents_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let sale = seed_sale(&pool, None, "guard buyer", d(2024, 6, 1), actor).await;
+        let (account, method) = owned_pair(&pool, "wallet one").await;
+        let (moved_account, _) = owned_pair(&pool, "wallet two").await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO sale_payments (sale_id, account_id, method_id, amount, date, created_by)\n             VALUES (?, ?, ?, '5', '2024-06-01', ?) RETURNING id",
+        )
+        .bind(sale)
+        .bind(account)
+        .bind(method)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        // Insert-only, deliberately asymmetric: the stored account is the
+        // historical fact of where the money landed, while the method is
+        // mutable configuration. A BEFORE UPDATE twin would block exactly this.
+        sqlx::query("UPDATE sale_payments SET account_id = ? WHERE id = ?")
+            .bind(moved_account)
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (stored_account,): (i64,) =
+            sqlx::query_as("SELECT account_id FROM sale_payments WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored_account, moved_account,
+            "divergence after birth is allowed; history does not move"
+        );
+    }
 
     async fn memory_pool() -> SqlitePool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
@@ -1844,11 +2109,27 @@ mod tests {
                 .await
                 .unwrap(),
             };
-        let (method,): (i64,) =
-            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        // Migration 44 guards the (account, method) pair on the payment row,
+        // so the fixture needs a method THIS wallet owns (the seeded methods
+        // are unassigned on a fresh database).
+        let method: i64 = match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = 'doc wallet cash' AND account_id = ?",
+        )
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by)\n                 VALUES ('doc wallet cash', ?, ?) RETURNING id",
+            )
+            .bind(account)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
         (account, method)
     }
 

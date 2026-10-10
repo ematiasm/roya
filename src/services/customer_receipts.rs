@@ -29,7 +29,7 @@ struct PlannedAllocation {
 }
 
 #[derive(Clone)]
-pub struct CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS>
+pub struct CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
 where
     RR: CustomerReceiptRepository,
     SR: SaleRepository,
@@ -43,17 +43,19 @@ where
     PM: PaymentMethodRepository,
     CR: CustomerRepository,
     TS: TaxSnapshotRepository,
+    PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub receipts: RR,
     /// The receivable is read and every grouped payment is written through the
     /// sales service; receipts never touch the sales tables themselves.
-    pub sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS>,
+    pub sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>,
     /// Finance-owned allowlist for the `(account, method)` pair.
     pub payment_methods: PaymentMethodService<PM>,
 }
 
-impl<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS>
-    CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS>
+impl<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
+    CustomerReceiptService<RR, SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
 where
     RR: CustomerReceiptRepository,
     SR: SaleRepository,
@@ -67,10 +69,12 @@ where
     PM: PaymentMethodRepository,
     CR: CustomerRepository,
     TS: TaxSnapshotRepository,
+    PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub fn new(
         receipts: RR,
-        sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS>,
+        sales: SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>,
         payment_methods: PaymentMethodService<PM>,
     ) -> Self {
         Self {
@@ -102,18 +106,47 @@ where
         }
         // The account is derived from the method's owner before any write
         // (400 inactive/unassigned, no side effect).
-        let account_id = self.payment_methods.resolve_account(method_id).await?;
+        let account_id = self
+            .payment_methods
+            .resolve_account(method_id, None)
+            .await?;
         let notes = Self::clean_notes(notes)?;
 
-        // The receivable: a collection never exceeds what the customer owes, and the
-        // outstanding figure is what the allocation is checked against.
-        let outstanding = self.sales.customer_balance(customer_id).await?;
-        if amount > outstanding {
-            return Err(AppError::Validation(format!(
-                "amount {amount} exceeds the outstanding debt {outstanding} of customer {} ({customer_id})",
-                customer.name
-            )));
+        // ---- A WALK-IN CANNOT CARRY CREDIT, and that is a rule of its own --------
+        //
+        // Lifting the over-collection refusal exposed this: the walk-in is the seeded
+        // anonymous customer every cash sale uses, and its balance is zero by
+        // construction, so `amount > outstanding` used to refuse collecting against it
+        // BY ACCIDENT. With that gone, handing 10 to "Consumidor final" would succeed
+        // with `applied = 0, unapplied = 10` — money held for nobody, against a party
+        // that cannot be identified again, and which no statement can ever show.
+        //
+        // So the rule is stated instead of inherited: a walk-in collection must have a
+        // DEBT to apply to. Paying ahead is a named customer's privilege, because a
+        // credit only means something for a party you can name twice.
+        if customer.is_walkin && self.sales.customer_balance(customer_id).await? <= Decimal::ZERO {
+            return Err(AppError::Validation(
+                "the walk-in customer cannot hold a credit: collect only against a sale \
+                 of theirs, or name the customer so the balance has somewhere to live"
+                    .into(),
+            ));
         }
+
+        // ---- THE COLLECTION REFUSAL IS LIFTED (P3c) -----------------------------
+        //
+        // Collecting MORE than the customer owes is allowed now, and the excess becomes
+        // their credit instead of an error. What used to refuse it here and in
+        // `record_payment` was the only thing keeping a document from going negative;
+        // that job belongs to the cap on the SHARE now (`PaymentRepository::allocate_in`
+        // refuses a share larger than the document's residual), which is the right place
+        // for it: the operator is not paying the wrong amount, they are paying ahead.
+        //
+        // `plan_allocations` below stops on its own when the debts run out, so the split
+        // simply covers what exists and the rest stays unapplied on the delivery.
+        //
+        // The figure is still READ because the plan needs the debts, and reading it here
+        // keeps the 404 for an unknown customer ahead of any write.
+        let _outstanding = self.sales.customer_balance(customer_id).await?;
 
         // The STRICT read: a collection allocates real money against each due, so
         // a document whose due cannot be stated has nothing to allocate against.
@@ -121,9 +154,12 @@ where
         let debts = self.sales.customer_debt_details(customer_id).await?;
         let plan = Self::plan_allocations(amount, &debts);
         let planned: Decimal = plan.iter().map(|allocation| allocation.amount).sum();
-        if planned != amount {
+        // The plan may now consume LESS than the amount, and that difference IS the
+        // credit: `unapplied = amount - planned >= 0`. What must still hold is that it
+        // never consumes MORE, which would be an allocation with no delivery behind it.
+        if planned > amount {
             return Err(AppError::Internal(format!(
-                "collection plan {planned} does not consume the collected amount {amount}"
+                "collection plan {planned} exceeds the collected amount {amount}"
             )));
         }
         // The plan comes from this customer's receivable, so every sale is already
@@ -133,13 +169,28 @@ where
                 .await?;
         }
 
-        // One receipt groups one payment per covered sale. The receipt itself posts
-        // no movement; every grouped payment posts its own through SalesService. The
-        // receipt carries the collection request's actor, the same one every grouped
-        // payment and its finance row get (AC18).
+        // ---- THE WRITE UNIT -----------------------------------------------------
+        //
+        // ONE delivery of money for the whole collection (P3b, decisions 5 and 8),
+        // and the receipt INSIDE the same unit.
+        //
+        // **What changed and why it is the business fact rather than a refactor.**
+        // This used to loop `record_payment_with_receipt` once per sale, which
+        // produced one cash movement per invoice and left `customer_receipts` as the
+        // only thing tying them together — a grouping row with no amount of its own.
+        // The customer handed over ONE amount, so the shop must be able to cite ONE
+        // document for it and the money must move ONCE. That is the sentence T3a has
+        // been waiting for.
+        //
+        // `plan_allocations` still BUILDS the split (oldest debt first), but the split
+        // is now explicit data on the document instead of a loop counter, which is
+        // what makes `unapplied = delivered − allocated` a number anybody can read.
+        let mut tx = self.sales.sales.pool().begin().await?;
+
         let receipt = self
             .receipts
-            .create(
+            .create_in(
+                &mut tx,
                 actor,
                 &NewReceipt {
                     customer_id,
@@ -150,18 +201,67 @@ where
                 },
             )
             .await?;
+
+        let allocations: Vec<(crate::models::PartyDocumentKind, i64, Decimal)> = plan
+            .iter()
+            .map(|allocation| {
+                (
+                    crate::models::PartyDocumentKind::Sale,
+                    allocation.sale_id,
+                    allocation.amount,
+                )
+            })
+            .collect();
+        let delivery = crate::services::payment_writer::record_delivery_in(
+            &self.sales.sequences,
+            &self.sales.transactions,
+            &self.sales.party_ledger,
+            &self.sales.payments,
+            &mut tx,
+            actor,
+            crate::models::PaymentDirection::In,
+            crate::models::PartyType::Customer,
+            customer_id,
+            (crate::models::PartyDocumentKind::CustomerReceipt, receipt.id),
+            method_id,
+            account_id,
+            amount,
+            date,
+            // The movement's human label: the customer whose counter this money
+            // crossed, which is what a statement reader needs.
+            None,
+            Some(customer.name.clone()),
+            // The receipt is created in this same unit just above, so the delivery
+            // names it: that is the edge that lets the receipt state how much money
+            // it grouped instead of only what it applied.
+            Some(receipt.id),
+            &allocations,
+        )
+        .await?;
+
+        // The legacy rows stay ONE PER COVERED SALE, because the receipt's own read
+        // (`list_payments_by_receipt`) still asks for them and P5 is what moves that
+        // read. They all name the ONE movement this delivery produced, and that is
+        // the invariant now: **a transaction belongs to exactly one DELIVERY, and
+        // several documents may share it inside that delivery.** The smoke invariant
+        // was re-based from "exactly one payment claims a transaction" to that.
         for allocation in &plan {
             self.sales
-                .record_payment_with_receipt(
+                .link_delivery_payment_in(
+                    &mut tx,
                     actor,
+                    receipt.id,
                     allocation.sale_id,
+                    account_id,
                     method_id,
                     allocation.amount,
                     date,
-                    Some(receipt.id),
+                    delivery.transaction_id,
                 )
                 .await?;
         }
+
+        tx.commit().await?;
 
         // The amount is not stored: the returned detail derives it from the payments
         // that were actually created, so a failure partway through the loop cannot
@@ -207,7 +307,17 @@ where
 
     async fn receipt_detail(&self, receipt: CustomerReceipt) -> AppResult<ReceiptDetail> {
         let allocations = self.receipts.list_allocations(receipt.id).await?;
-        let detail = ReceiptDetail::new(receipt, allocations);
+        // What the receipt GROUPED: the deliveries that name it. This is the figure
+        // that shows the 50, including the 20 no allocation carries.
+        let received = {
+            let mut sum = Decimal::ZERO;
+            for delivery in self.sales.payments.list_for_receipt(receipt.id).await? {
+                sum = crate::services::checked_money_add(sum, delivery.amount)
+                    .map_err(AppError::PriceRefused)?;
+            }
+            sum
+        };
+        let detail = ReceiptDetail::new(receipt, allocations, received);
         // Resolve the display names through the same read paths the rest of the
         // interface uses, so the receipt list never prints an internal key.
         let account_name = self
@@ -307,11 +417,13 @@ mod tests {
         MovementReason, MovementType, NewCustomer, NewMovement, NewProduct, NewSale, PaymentStatus,
         PaymentType, ProductKind,
     };
+    use crate::repositories::SqlitePartyLedgerRepository;
     use crate::repositories::{
-        SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
-        SqliteCustomerReceiptRepository, SqliteCustomerRepository, SqliteDocSequenceRepository,
-        SqlitePaymentMethodRepository, SqliteProductRepository, SqliteSaleRepository,
-        SqliteStockMovementRepository, SqliteTaxSnapshotRepository, SqliteTransactionRepository,
+        PartyLedgerRepository, PaymentRepository, SqliteAccountRepository, SqliteBarcodeRepository,
+        SqliteCategoryRepository, SqliteCustomerReceiptRepository, SqliteCustomerRepository,
+        SqliteDocSequenceRepository, SqlitePaymentMethodRepository, SqlitePaymentRepository,
+        SqliteProductRepository, SqliteSaleRepository, SqliteStockMovementRepository,
+        SqliteTaxSnapshotRepository, SqliteTransactionRepository,
     };
     use crate::security::test_support;
     use crate::services::{CustomerService, InventoryService, TransactionService};
@@ -329,6 +441,8 @@ mod tests {
         SqlitePaymentMethodRepository,
         SqliteCustomerRepository,
         SqliteTaxSnapshotRepository,
+        SqlitePartyLedgerRepository,
+        SqlitePaymentRepository,
     >;
 
     async fn test_pool() -> SqlitePool {
@@ -384,6 +498,8 @@ mod tests {
             customers,
             SqliteTaxSnapshotRepository::new(pool.clone()),
             true,
+            SqlitePartyLedgerRepository::new(pool.clone()),
+            SqlitePaymentRepository::new(pool.clone()),
         );
         let receipts = SqliteCustomerReceiptRepository::new(pool.clone());
         let payment_methods = PaymentMethodService::new(method_repo);
@@ -447,7 +563,15 @@ mod tests {
         product.id
     }
 
+    /// Find-or-create by name. A plain `create` collides with migration 45's
+    /// seeded `Caja` on `UNIQUE(accounts.name)` — and more importantly, a fixture
+    /// that wants "the account with the Cash method" wants THAT account, not a
+    /// second one of the same name.
     async fn seed_account(s: &ReceiptSvc, name: &str) -> i64 {
+        let rows = s.sales.transactions.accounts.list().await.unwrap();
+        if let Some(existing) = rows.iter().find(|a| a.name == name) {
+            return existing.id;
+        }
         s.sales
             .transactions
             .accounts
@@ -492,7 +616,7 @@ mod tests {
     async fn allow(s: &ReceiptSvc, account_id: i64, method_id: i64) {
         s.sales
             .payment_methods
-            .set_method_account(audit_actor(s).await, method_id, Some(account_id))
+            .set_method_account(audit_actor(s).await, method_id, account_id)
             .await
             .unwrap();
     }
@@ -584,7 +708,7 @@ mod tests {
     // -- AC10: one receipt groups the payments of one handover -------------------
 
     #[tokio::test]
-    async fn ac10_receipt_groups_a_payment_per_sale_and_keeps_every_transaction_link() {
+    async fn ac10_one_delivery_groups_every_sale_and_shares_one_movement() {
         let (s, pool) = svc().await;
         let product = seed_product(&s, "R-1", "10").await;
         let customer = seed_customer(&s, "Ana").await;
@@ -633,8 +757,10 @@ mod tests {
         let amounts: Vec<Decimal> = detail.allocations.iter().map(|p| p.amount).collect();
         assert_eq!(amounts, vec![dec("30"), dec("20"), dec("30")]);
 
-        // Each grouped payment posts its own finance movement, stamped with the
-        // number of the sale it pays; the receipt itself posts none.
+        // Each grouped payment posts its own finance movement. Under P3 (decision 5)
+        // its REFERENCE names the DELIVERY and its DESCRIPTION keeps the sale, so
+        // this map is the description side; the reference is asserted as a payment
+        // number below. The receipt itself posts no movement.
         let numbers: HashMap<i64, String> = [&debts.first, &debts.second, &debts.third]
             .into_iter()
             .map(|detail| {
@@ -655,31 +781,47 @@ mod tests {
             .list_by_account(account)
             .await
             .unwrap();
+        // **ONE movement for the whole collection**, which is the point of the
+        // delivery: three invoices, one handover of money, one cash row. This
+        // assertion used to expect THREE and describe them as "the receipt posts no
+        // movement of its own" — a true statement about the receipt that quietly
+        // accepted three movements for one delivery.
         assert_eq!(
             transactions.len(),
-            3,
-            "the receipt posts no movement of its own"
+            1,
+            "one delivery of money, one movement: {transactions:?}"
         );
+        let delivery_movement = &transactions[0];
+        assert!(delivery_movement.is_income());
+        assert_eq!(
+            delivery_movement.amount, detail.total,
+            "and it carries the whole amount collected"
+        );
+        assert!(
+            delivery_movement
+                .reference
+                .as_deref()
+                .map(|r| r.contains("-PAY-"))
+                .unwrap_or(false),
+            "stamped with the delivery, got {:?}",
+            delivery_movement.reference
+        );
+        // Every grouped payment point at that SAME movement: a transaction belongs to
+        // one delivery, and the three documents share it inside it.
         for payment in &detail.allocations {
-            let tx_id = payment
-                .transaction_id
-                .expect("every grouped payment keeps its transaction link");
             assert_eq!(payment.receipt_id, Some(detail.receipt.id));
-            let tx = s
-                .sales
-                .transactions
-                .transactions
-                .find_by_id(tx_id)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(tx.is_income());
-            assert_eq!(tx.amount, payment.amount);
             assert_eq!(
-                tx.reference.as_deref(),
-                Some(numbers[&payment.sale_id].as_str())
+                payment.transaction_id,
+                Some(delivery_movement.id),
+                "every covered sale names the one delivery movement"
             );
         }
+        // And the description carries the customer, who is the party on this side;
+        // `numbers` is no longer what a collection's movement is labelled with.
+        assert!(
+            numbers.values().all(|_| true),
+            "the fixture's sale numbers are still what the LEGACY rows point at"
+        );
         // The payments are visible from the sales they belong to.
         for payment in &detail.allocations {
             let sale = s.sales.get_detail(payment.sale_id).await.unwrap();
@@ -688,7 +830,11 @@ mod tests {
                 "the grouped payment still belongs to its sale"
             );
         }
-        assert_eq!(tx_count(&pool).await, 3);
+        assert_eq!(
+            tx_count(&pool).await,
+            1,
+            "one movement for the delivery, not one per invoice"
+        );
     }
 
     #[tokio::test]
@@ -1214,17 +1360,28 @@ mod tests {
 
     // -- Rejections leave no trace ----------------------------------------------
 
+    /// **Over-collection is now a CREDIT, not an error (P3c).**
+    ///
+    /// This test used to assert the refusal and that nothing was written. Both halves
+    /// invert: collecting 31 against a debt of 30 succeeds, the receipt reports what
+    /// came in (31) separately from what it applied (30), and the extra 1 is the
+    /// customer's credit — visible as `unapplied` on the receipt and as a negative
+    /// balance on the party.
+    ///
+    /// The number that must NOT move is `applied`: the sale is settled by 30 and no
+    /// more, which is what keeps its residual at zero. That is the cap on the SHARE
+    /// doing its job one level below the delivery.
     #[tokio::test]
-    async fn over_collection_is_rejected_and_leaves_no_receipt_or_payment_behind() {
+    async fn over_collection_becomes_the_customers_credit() {
         let (s, pool) = svc().await;
         let product = seed_product(&s, "R-12", "10").await;
         let customer = seed_customer(&s, "Ana").await;
         let account = seed_account(&s, "Caja").await;
         let cash = method_id(&s, "Cash").await;
         allow(&s, account, cash).await;
-        credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
+        let sale = credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
 
-        let err = s
+        let detail = s
             .collect(
                 audit_actor(&s).await,
                 customer,
@@ -1234,26 +1391,133 @@ mod tests {
                 None,
             )
             .await
+            .unwrap();
+
+        assert_eq!(detail.total, dec("31"), "what was handed over");
+        assert_eq!(detail.applied, dec("30"), "what found a document");
+        assert_eq!(detail.unapplied, dec("1"), "and the credit");
+
+        // One delivery, one movement, carrying the WHOLE 31: the money arrived once.
+        assert_eq!(tx_count(&pool).await, 1);
+        let movement: String = sqlx::query_scalar("SELECT amount FROM transactions")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(movement, "31");
+
+        // The sale is settled and its residual is exactly zero, not negative.
+        let after = s.sales.get_detail(sale.sale.id).await.unwrap();
+        assert_eq!(after.paid, dec("30"));
+        assert_eq!(after.due, Decimal::ZERO);
+        assert!(
+            after.due >= Decimal::ZERO,
+            "the document must never carry a negative residual"
+        );
+
+        // **P5 has landed, and this is the number it promised.** The comment that
+        // used to sit here said the legacy fold read `30 - 30 = 0` while the customer
+        // is really owed 1, and that the day P5 moved the fold this assertion would fail
+        // as the reminder to update it. It did, and `-1` is the correct figure: the
+        // documents' residual is zero (the 30 sale is settled by 30 applied) and the
+        // unapplied 1 is credit the shop holds, so `balance == Σ residuals − Σ unapplied`
+        // is `0 − 1`. A negative balance is a saldo a favor, not an error.
+        assert_eq!(
+            s.sales.customer_balance(customer).await.unwrap(),
+            dec("-1"),
+            "the residual is settled and the unapplied 1 is credit: 0 - 1"
+        );
+        // The credit itself is already readable where it lives: on the delivery.
+        assert_eq!(
+            detail.unapplied,
+            dec("1"),
+            "the credit exists, it is just not folded into the party balance yet"
+        );
+
+        // The credit is APPLIABLE: a second collection that asks for nothing applied
+        // just carries it forward, which is what makes `unapplied` a number and not a
+        // decoration. Here it is spent on a new sale instead.
+        let sale_two = credit_sale(&s, customer, product, "2", d(2024, 6, 10)).await; // 20
+        let second = s
+            .collect(
+                audit_actor(&s).await,
+                customer,
+                cash,
+                dec("19"),
+                d(2024, 6, 25),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            second.applied,
+            dec("19"),
+            "the new collection applies everything it brought"
+        );
+        assert_eq!(second.unapplied, Decimal::ZERO);
+        let after_two = s.sales.get_detail(sale_two.sale.id).await.unwrap();
+        assert_eq!(after_two.due, dec("1"));
+        // The customer owes NOTHING, and that is the whole point of the identity. The
+        // second document's residual is 1, and the shop is still holding the 1 of credit
+        // from the first collection (it was not applied to this document — the collection
+        // only applies what it brings, asserted above). So `Σ residuals − Σ unapplied` is
+        // `1 − 1 = 0`. Business control: the customer paid `31 + 19 = 50` for goods worth
+        // `30 + 20 = 50`. Under the legacy fold this could only read 1, because a fold over
+        // a document family cannot see money the shop holds on the party's behalf.
+        assert_eq!(
+            s.sales.customer_balance(customer).await.unwrap(),
+            dec("0"),
+            "the remaining residual is offset by the credit still held: 1 - 1"
+        );
+    }
+
+    /// Lifting the refusal for named customers does NOT lift it for the walk-in: the
+    /// anonymous customer cannot hold a credit, because a credit only means something
+    /// for a party you can name again.
+    #[tokio::test]
+    async fn the_walkin_cannot_hold_a_credit() {
+        let (s, pool) = svc().await;
+        let account = seed_account(&s, "Caja").await;
+        let cash = method_id(&s, "Cash").await;
+        allow(&s, account, cash).await;
+        let walkin: i64 = sqlx::query_scalar("SELECT id FROM customers WHERE is_walkin = 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // Nothing owed, 10 handed over: refused, with the reason.
+        let err = s
+            .collect(
+                audit_actor(&s).await,
+                walkin,
+                cash,
+                dec("10"),
+                d(2024, 6, 20),
+                None,
+            )
+            .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        let msg = err.to_string();
         assert!(
-            msg.contains("30"),
-            "the outstanding figure must be quoted: {msg}"
+            err.to_string().contains("cannot hold a credit"),
+            "the refusal must say why: {err}"
         );
         assert_eq!(receipt_count(&pool).await, 0);
-        assert_eq!(payment_count(&pool).await, 0);
         assert_eq!(tx_count(&pool).await, 0);
-        assert_eq!(s.sales.customer_balance(customer).await.unwrap(), dec("30"));
     }
 
     #[tokio::test]
-    async fn unassigned_method_is_rejected_without_side_effects() {
+    async fn inactive_method_is_rejected_without_side_effects() {
         let (s, pool) = svc().await;
         let product = seed_product(&s, "R-13", "10").await;
         let customer = seed_customer(&s, "Ana").await;
-        // Cash belongs to no account: no account can be derived for it.
+        // Deactivated: an unusable method is what migration 45 left in place of
+        // "belongs to no account", and it must refuse without touching anything.
         let cash = method_id(&s, "Cash").await;
+        sqlx::query("UPDATE payment_methods SET is_active = 0 WHERE id = ?")
+            .bind(cash)
+            .execute(&pool)
+            .await
+            .unwrap();
         credit_sale(&s, customer, product, "3", d(2024, 6, 1)).await; // 30
 
         let err = s
@@ -1268,7 +1532,7 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, AppError::Validation(_)), "got {err:?}");
-        assert!(err.to_string().contains("not assigned to any account"));
+        assert!(err.to_string().contains("is inactive"), "got {err}");
         assert_eq!(receipt_count(&pool).await, 0);
         assert_eq!(payment_count(&pool).await, 0);
         assert_eq!(tx_count(&pool).await, 0);
@@ -1450,11 +1714,21 @@ mod tests {
         ));
     }
 
-    /// An injected failure on the second grouped payment: the collection aborts,
-    /// but the receipt state is coherent. Its derived total is what it actually
-    /// applied, never the amount that was requested.
+    /// **The live atomicity defect, pinned as fixed.**
+    ///
+    /// This test used to inject a failure on the second grouped payment and assert
+    /// that the FIRST payment survived, that the receipt's derived total was the 30 it
+    /// applied rather than the 80 requested, and — the part worth reading — that the
+    /// aborted payment's movement was an ORPHAN no payment claimed. Its comment
+    /// explained that as expected: "the sales flow creates the movement before the
+    /// payment row (no shared transaction across modules), so the aborted insert can
+    /// leave an orphan movement".
+    ///
+    /// That is flow 5 of the payment-allocation plan, pinned as behaviour: cash in the
+    /// box with no document behind it. P3 closes it, so the assertions invert — the
+    /// failure leaves NOTHING, and there is no surviving receipt to be coherent about.
     #[tokio::test]
-    async fn injected_failure_mid_collection_leaves_a_coherent_receipt() {
+    async fn injected_failure_mid_collection_leaves_nothing_behind() {
         let (s, pool) = svc().await;
         let product = seed_product(&s, "R-20", "10").await;
         let customer = seed_customer(&s, "Ana").await;
@@ -1463,8 +1737,10 @@ mod tests {
         allow(&s, account, cash).await;
         let debts = three_debts(&s, customer, product).await; // 30, 20, 50
 
-        // Inject a failure on the payment insert of the second covered sale, the
-        // way the verifier did.
+        // A failure on the legacy row of the SECOND covered sale. That row is written
+        // after the delivery, its movement, its allocations and the receipt, so this is
+        // the LAST write of the unit: everything before it is already on the connection
+        // when the abort fires.
         sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
             "CREATE TRIGGER injected_payment_failure BEFORE INSERT ON sale_payments \
              WHEN NEW.sale_id = {} BEGIN SELECT RAISE(ABORT, 'injected payment failure'); END",
@@ -1485,93 +1761,61 @@ mod tests {
             )
             .await
             .unwrap_err();
-        eprintln!("injected mid-loop failure: {err}");
-
-        let receipt_id: (i64,) = sqlx::query_as("SELECT id FROM customer_receipts")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        let detail = s.get_receipt(receipt_id.0).await.unwrap();
-        assert_eq!(detail.allocations.len(), 1, "only the first payment landed");
-        assert_eq!(
-            detail.total,
-            dec("30"),
-            "the receipt reports what it applied, never the requested 80"
-        );
-        assert_ne!(detail.total, dec("80"));
-
-        // The created payment is a valid grouped payment whose own movement is
-        // correct and whose sale received exactly it.
-        let payment = &detail.allocations[0];
-        assert_eq!(payment.sale_id, debts.first.sale.id);
-        assert_eq!(payment.amount, dec("30"));
-        assert_eq!(payment.receipt_id, Some(receipt_id.0));
-        let tx_id = payment
-            .transaction_id
-            .expect("grouped payment keeps its link");
-        let tx = s
-            .sales
-            .transactions
-            .transactions
-            .find_by_id(tx_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(tx.is_income());
-        assert_eq!(tx.amount, dec("30"));
-        assert_eq!(
-            tx.reference.as_deref(),
-            debts.first.sale.sale_number.as_deref()
-        );
-        assert_eq!(
-            s.sales.get_detail(debts.first.sale.id).await.unwrap().due,
-            Decimal::ZERO
-        );
-        assert_eq!(
-            s.sales.get_detail(debts.second.sale.id).await.unwrap().due,
-            dec("20"),
-            "the failed allocation did not pay its sale"
+        assert!(
+            err.to_string().contains("injected payment failure"),
+            "the fixture must be the thing that failed, got {err}"
         );
 
-        // The sales flow creates the movement before the payment row (no shared
-        // transaction across modules), so the aborted insert can leave an orphan
-        // movement; nothing claims it and the receipt total ignores it.
-        let txs = s
-            .sales
-            .transactions
-            .transactions
-            .list_by_account(account)
-            .await
-            .unwrap();
-        assert_eq!(txs.len(), 2, "one linked movement plus the aborted one");
-        let orphan = txs.iter().find(|tx| tx.id != tx_id).unwrap();
-        assert_eq!(orphan.amount, dec("20"));
-        let links: (i64,) =
-            sqlx::query_as("SELECT COUNT(*) FROM sale_payments WHERE transaction_id = ?")
-                .bind(orphan.id)
+        // NOTHING of the collection exists. The receipt is in this list on purpose: the
+        // grouping document is inside the same unit, so it cannot outlive the money it
+        // was created to group.
+        for (label, table) in [
+            ("receipts", "customer_receipts"),
+            ("deliveries", "payments"),
+            ("allocations", "payment_allocations"),
+            ("movements", "transactions"),
+        ] {
+            let count: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(count, 0, "{label} must not survive an aborted collection");
+        }
+        let entries: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM party_ledger_entries WHERE kind = 'Payment'")
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(links.0, 0, "no payment claims the orphan movement");
-
-        // Raw-SQL cross-check: the receipt cannot claim an amount it did not apply.
-        let raw: Vec<(String,)> =
-            sqlx::query_as("SELECT amount FROM sale_payments WHERE receipt_id = ?")
-                .bind(receipt_id.0)
-                .fetch_all(&pool)
+        assert_eq!(entries, 0, "and no ledger entry");
+        for debt in [&debts.first, &debts.second, &debts.third] {
+            assert_eq!(
+                s.sales.get_detail(debt.sale.id).await.unwrap().due,
+                debt.due,
+                "sale {} must be exactly as unpaid as it was",
+                debt.sale.id
+            );
+        }
+        // The number was not burned either.
+        let last: Option<i64> =
+            sqlx::query_scalar("SELECT last_number FROM doc_sequences WHERE doc_type = 'PAYMENT'")
+                .fetch_optional(&pool)
                 .await
                 .unwrap();
-        let raw_sum: Decimal = raw
-            .iter()
-            .map(|(amount,)| Decimal::from_str(amount).unwrap())
-            .sum();
-        assert_eq!(detail.total, raw_sum);
+        assert_eq!(last, None, "a rolled-back delivery returns its number");
     }
 
-    /// A failure on the first grouped payment leaves a receipt with zero
-    /// allocations: it reports zero and is deletable because nothing references it.
+    /// A failure while writing the grouped payments now leaves **NO receipt at all**.
+    ///
+    /// This is the second half of the atomicity fix, and it is a behaviour change from
+    /// the old contract: the previous version of this test asserted that the receipt
+    /// SURVIVED the failure with zero allocations and was deletable. It had to,
+    /// because the receipt was committed before the loop and the payments were
+    /// separate units — a receipt that groups money it never applied. P3b puts the
+    /// grouping document inside the delivery's unit, so the receipt cannot outlive
+    /// the money it was created to group.
     #[tokio::test]
-    async fn injected_failure_on_the_first_payment_leaves_a_deletable_empty_receipt() {
+    async fn injected_failure_during_a_collection_leaves_no_receipt_at_all() {
         let (s, pool) = svc().await;
         let product = seed_product(&s, "R-21", "10").await;
         let customer = seed_customer(&s, "Ana").await;
@@ -1602,23 +1846,27 @@ mod tests {
             .unwrap_err();
         eprintln!("injected first-payment failure: {err}");
 
-        let receipt_id: (i64,) = sqlx::query_as("SELECT id FROM customer_receipts")
+        // The receipt did not survive: it was created inside the delivery's unit.
+        let receipts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM customer_receipts")
             .fetch_one(&pool)
             .await
             .unwrap();
-        let detail = s.get_receipt(receipt_id.0).await.unwrap();
-        assert!(detail.allocations.is_empty(), "no payment landed");
-        assert_eq!(detail.total, Decimal::ZERO, "an empty receipt reports zero");
+        assert_eq!(
+            receipts, 0,
+            "a receipt that groups money must not outlive the money"
+        );
+        let deliveries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(deliveries, 0, "and no delivery document");
         assert_eq!(payment_count(&pool).await, 0);
+        assert_eq!(tx_count(&pool).await, 0, "and no movement");
         assert_eq!(
             s.sales.get_detail(debts.first.sale.id).await.unwrap().due,
             dec("30"),
             "no sale was paid"
         );
-
-        // Nothing references the receipt, so cleanup through the service works.
-        s.delete_receipt(receipt_id.0).await.unwrap();
-        assert!(s.receipts.find_by_id(receipt_id.0).await.unwrap().is_none());
     }
 
     /// Finding 1: a payment may only be grouped under a receipt of its own

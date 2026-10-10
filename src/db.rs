@@ -3,6 +3,8 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
 use std::str::FromStr;
 
+use crate::error::AppResult;
+
 /// Canonical TEXT encoding for every timestamp this database stores or binds.
 ///
 /// It produces exactly the shape SQLite itself writes — the same bytes as
@@ -41,7 +43,12 @@ pub fn base_connect_options(database_url: &str) -> Result<SqliteConnectOptions, 
 }
 
 /// Create a pool from DATABASE_URL.  Falls back to `sqlite://roya.db`.
-pub async fn create_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> {
+///
+/// The error is [`crate::error::AppError`] rather than `sqlx::Error` because
+/// the party-ledger backfill runs in here after the migrations and can be
+/// REFUSED as well as fail: a document total the checked fold cannot carry
+/// answers `PriceRefused`, which is a rule and not a driver fault.
+pub async fn create_pool(database_url: &str) -> AppResult<SqlitePool> {
     let opts = base_connect_options(database_url)?
         .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
         .synchronous(sqlx::sqlite::SqliteSynchronous::Normal);
@@ -52,7 +59,17 @@ pub async fn create_pool(database_url: &str) -> Result<SqlitePool, sqlx::Error> 
         .await?;
 
     // Run migrations embedded at compile time (uses `migrations/` dir)
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    sqlx::migrate!("./migrations")
+        .run(&pool)
+        .await
+        .map_err(sqlx::Error::from)?;
+
+    // There is NO ledger backfill here, and its absence is deliberate: every write
+    // path stamps its own entry inside the unit that owns the event, so a database
+    // whose papers were all created by this code needs nothing reconstructed. The
+    // function that used to sit here read the five legacy payment tables, which is
+    // why it had to go before they could be dropped. See
+    // `repositories::party_ledger_repo` for the full reason.
 
     Ok(pool)
 }

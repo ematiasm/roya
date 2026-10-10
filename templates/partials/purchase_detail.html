@@ -611,7 +611,7 @@
         <select id="confirm-method" name="method_id"
                 {% if record.purchase.payment_type.to_string() == "Credit" %}disabled{% else %}required{% endif %} class="field">
           {% for m in method_options %}
-          <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ localization.payment_method_label(m.name.as_str(), m.account_name.as_deref()) }}{% if !m.is_active %} {{ localization.tr(crate::localization::MessageKey::CommonInactiveLabel) }}{% endif %}</option>
+          <option value="{{ m.id }}" >{{ localization.payment_method_label(m.name.as_str(), m.account_name.as_str()) }}{% if !m.is_active %} {{ localization.tr(crate::localization::MessageKey::CommonInactiveLabel) }}{% endif %}</option>
           {% endfor %}
         </select>
       </div>
@@ -655,7 +655,7 @@
         <label for="payment-method" class="field-label">{{ localization.tr(crate::localization::MessageKey::SalesMethodDerived) }}</label>
         <select id="payment-method" name="method_id" required class="field">
           {% for m in method_options %}
-          <option value="{{ m.id }}" {% if m.account_id.is_none() %}disabled{% endif %}>{{ localization.payment_method_label(m.name.as_str(), m.account_name.as_deref()) }}{% if !m.is_active %} {{ localization.tr(crate::localization::MessageKey::CommonInactiveLabel) }}{% endif %}</option>
+          <option value="{{ m.id }}" >{{ localization.payment_method_label(m.name.as_str(), m.account_name.as_str()) }}{% if !m.is_active %} {{ localization.tr(crate::localization::MessageKey::CommonInactiveLabel) }}{% endif %}</option>
           {% endfor %}
         </select>
       </div>

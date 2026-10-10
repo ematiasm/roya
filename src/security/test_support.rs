@@ -19,6 +19,24 @@ use crate::security::password::PasswordHasher;
 use crate::security::session::{hash_token, mint_token, SessionPolicy, SESSION_COOKIE};
 use crate::services::identity::{IdentityService, SystemClock, ThrottleConfig};
 
+/// A process-unique suffix for fixture NAMES.
+///
+/// Migration 45 seeds an account literally called `Caja` together with the Cash
+/// method it owns, and `accounts.name` is UNIQUE. A route-test fixture that
+/// planted its own `Caja` used to be the only way to get a well-known name; now
+/// that name is taken before the test starts, so the fixture needs a name of its
+/// own while still passing the canonical word to
+/// `default_method_names_for_account_name`, which keys on the exact spelling.
+///
+/// It is also the collision guard the per-module `seq` parameters already encode:
+/// several fixtures in one binary share a pool, so a bare name would collide with
+/// itself across tests in the same run.
+pub fn fixture_seq() -> u32 {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(1_000);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
 /// The one session token every HTTP test authenticates with. Fixed so the
 /// cookie value can be a compile-time constant; only its sha256 digest is
 /// stored, exactly like the production path.

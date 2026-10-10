@@ -37,7 +37,7 @@ use crate::error::{AppError, AppResult};
 use crate::models::{
     format_purchase_return_number, MovementReason, MovementType, NewMovement, PriceRefusal,
     Purchase, PurchaseDetail, PurchaseLine, PurchaseReturn, PurchaseReturnDetail,
-    PurchaseReturnLine, PurchaseReturnPayment, PurchaseReturnStatus, RecordMoney,
+    PurchaseReturnLine, PurchaseReturnStatus, RecordMoney,
 };
 use crate::services::checked_money_sum;
 
@@ -57,7 +57,7 @@ struct RefundPlan {
 }
 
 #[derive(Clone)]
-pub struct PurchaseReturnService<RR, DR, PR, C, P, B, S, A, T>
+pub struct PurchaseReturnService<RR, DR, PR, C, P, B, S, A, T, PL, PY>
 where
     RR: crate::repositories::PurchaseReturnRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -68,15 +68,25 @@ where
     S: crate::repositories::StockMovementRepository,
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
+    PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub returns: RR,
     pub sequences: DR,
     pub purchases: PR,
     pub inventory: crate::services::InventoryService<C, P, B, S>,
     pub transactions: crate::services::TransactionService<A, T>,
+    /// The supplier's signed journal (T2), mirroring the customer side: a
+    /// confirmed return appends the `Return` that cancels part of the purchase's
+    /// `Charge`, in the same unit that moves the stock back.
+    pub party_ledger: PL,
+    /// The `payments` family (T3d): a cancelled purchase return moves the money back
+    /// out as a delivery, so this side needs the same document.
+    pub payments: PY,
 }
 
-impl<RR, DR, PR, C, P, B, S, A, T> PurchaseReturnService<RR, DR, PR, C, P, B, S, A, T>
+impl<RR, DR, PR, C, P, B, S, A, T, PL, PY>
+    PurchaseReturnService<RR, DR, PR, C, P, B, S, A, T, PL, PY>
 where
     RR: crate::repositories::PurchaseReturnRepository,
     DR: crate::repositories::DocSequenceRepository,
@@ -87,6 +97,8 @@ where
     S: crate::repositories::StockMovementRepository,
     A: crate::repositories::AccountRepository,
     T: crate::repositories::TransactionRepository,
+    PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub fn new(
         returns: RR,
@@ -94,6 +106,8 @@ where
         purchases: PR,
         inventory: crate::services::InventoryService<C, P, B, S>,
         transactions: crate::services::TransactionService<A, T>,
+        party_ledger: PL,
+        payments: PY,
     ) -> Self {
         Self {
             returns,
@@ -101,6 +115,8 @@ where
             purchases,
             inventory,
             transactions,
+            party_ledger,
+            payments,
         }
     }
 
@@ -130,7 +146,7 @@ where
     /// refusal is `DocumentTotalTooLarge` because no single line is at fault.
     fn document_money(
         lines: &[PurchaseReturnLine],
-        payments: &[PurchaseReturnPayment],
+        payments: &[crate::models::Payment],
     ) -> Result<RecordMoney, PriceRefusal> {
         let subtotals: Vec<Decimal> = lines.iter().map(|l| l.subtotal()).collect();
         let net_subtotal = checked_money_sum(subtotals.iter())?;
@@ -155,12 +171,25 @@ where
 
     async fn detail_for(&self, purchase_return: PurchaseReturn) -> AppResult<PurchaseReturnDetail> {
         let lines = self.returns.list_lines(purchase_return.id).await?;
-        let payments = self.returns.list_payments(purchase_return.id).await?;
-        let money = Self::document_money(&lines, &payments).map_err(AppError::PriceRefused)?;
+        let deliveries = self
+            .payments
+            .list_refunds_for_document_tolerant(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                purchase_return.id,
+            )
+            .await?;
+        if deliveries.unresolved_entries > 0 {
+            tracing::warn!(
+                document_id = purchase_return.id,
+                unresolved_entries = deliveries.unresolved_entries,
+                "some refund journal entries could not be resolved for the purchase return display"
+            );
+        }
+        let money =
+            Self::document_money(&lines, &deliveries.payments).map_err(AppError::PriceRefused)?;
         Ok(PurchaseReturnDetail {
             purchase_return,
             lines,
-            payments,
             net_subtotal: money.net_subtotal,
             total: money.total,
             paid: money.paid,
@@ -523,8 +552,11 @@ where
         // The document's money is resolved BEFORE any write below, exactly as on
         // the purchase side: a confirmation that cannot state what the return is
         // worth must refuse with nothing written.
-        let money = Self::document_money(&lines, &self.returns.list_payments(return_id).await?)
-            .map_err(AppError::PriceRefused)?;
+        let deliveries = self
+            .payments
+            .list_refunds_for_document(crate::models::PartyDocumentKind::PurchaseReturn, return_id)
+            .await?;
+        let money = Self::document_money(&lines, &deliveries).map_err(AppError::PriceRefused)?;
         let total = money.total;
 
         // ---- THE REFUND CAP -------------------------------------------------
@@ -554,9 +586,25 @@ where
         // cap cannot hold, and it is v1's answer rather than a solution. Do not
         // invent a credit-balance mechanism here to make that case fit; it needs
         // a decision, which is what the feature document still lists as open.
-        let parent_payments = self.purchases.list_payments(purchase.id).await?;
-        let collected = checked_money_sum(parent_payments.iter().map(|p| &p.amount))
+        let parts = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Purchase, &[purchase.id])
+            .await?
+            .remove(&purchase.id)
+            .ok_or_else(|| {
+                AppError::Internal(format!("purchase {} residual missing", purchase.id))
+            })?;
+        // This identity avoids counting a prior return as a payment:
+        // charge + signed returns - residual = applied allocations. The residual
+        // repository already builds all components with checked Decimal folds.
+        let after_returns = checked_money_sum([parts.charge, parts.signed_returns].iter())
             .map_err(AppError::PriceRefused)?;
+        let collected = after_returns
+            .checked_sub(parts.residual)
+            .ok_or(AppError::PriceRefused(PriceRefusal::DocumentTotalTooLarge))?;
+        let parent_payments = self
+            .parent_allocations(purchase.id, purchase.supplier_id)
+            .await?;
         if collected > Decimal::ZERO && total > collected {
             return Err(AppError::Validation(format!(
                 "return is worth {total} but purchase {} has only collected {collected} from \
@@ -575,7 +623,12 @@ where
         //
         // Everything from here to the COMMIT is ONE transaction: the sequence
         // number, one stock movement per tracked line, one Income per planned
-        // refund, the `purchase_return_payments` rows, and `set_confirmed`.
+        // refund, the refund's `payments` delivery, and `set_confirmed`.
+        //
+        // One thing left this comment: the refund's own row in
+        // `purchase_return_payments`, which migration 49 dropped. The refund is a
+        // `payments` delivery now, written through `payment_writer` in this same
+        // unit, so the money is still all-or-nothing with the goods.
         //
         // EVERY repository call inside is an `_in` form. That is not a style
         // choice here: a return has more steps than a purchase — a refund to
@@ -640,40 +693,64 @@ where
                 .await?;
         }
 
-        // 3 and 4. One Income per planned refund, `reference` = this return's
-        //    own number, then the payment row that claims it. An Income is money
-        //    ENTERING, so `create_with_reference_in` enforces no balance
-        //    precondition and the overdraft guard cannot fire — which is the
-        //    single behavioural difference from a credit note's Expense.
+        // 3. One refund delivery per planned amount. The shared writer creates
+        //    the Income, the In payment, and its Refund ledger entry in this
+        //    already-open unit. Income remains money ENTERING, so the overdraft
+        //    guard cannot fire. The payment replays the parent's historical
+        //    account/method, carries no allocations, and names this return in its
+        //    movement description; its transaction reference is the delivery
+        //    number by decision 5.
         for refund in &plan {
-            let income = self
-                .transactions
-                .create_with_reference_in(
-                    &mut tx,
-                    actor,
-                    refund.account_id,
-                    crate::models::TransactionKind::Income,
-                    refund.amount,
-                    Some(return_number.clone()),
-                    Some(return_number.clone()),
-                    purchase_return.return_date,
-                )
-                .await?;
-            self.returns
-                .create_payment_in(
-                    &mut tx,
-                    actor,
-                    return_id,
-                    refund.account_id,
-                    refund.method_id,
-                    refund.amount,
-                    purchase_return.return_date,
-                    Some(income.id),
-                )
-                .await?;
+            crate::services::payment_writer::record_delivery_in(
+                &self.sequences,
+                &self.transactions,
+                &self.party_ledger,
+                &self.payments,
+                &mut tx,
+                actor,
+                crate::models::PaymentDirection::In,
+                crate::models::PartyType::Supplier,
+                purchase.supplier_id,
+                (crate::models::PartyDocumentKind::PurchaseReturn, return_id),
+                refund.method_id,
+                refund.account_id,
+                refund.amount,
+                purchase_return.return_date,
+                None,
+                Some(return_number.clone()),
+                None,
+                &[],
+            )
+            .await?;
         }
 
-        // 5. The document exists from here.
+        // 5. The supplier's journal, in the SAME unit as the stock movement (T2
+        // of odd/tasks/party-ledger.md). A purchase return sends goods back, so it
+        // cancels part of what the purchase charged: a `Return` of `−total`, which
+        // folds the payable down by what went back.
+        //
+        // Written even when the refund plan is EMPTY, for the same reason as the
+        // customer side: the goods left whether or not money came with them, and a
+        // purchase confirmed but unpaid legitimately returns goods the shop has
+        // not paid for yet.
+        self.party_ledger
+            .insert_in(
+                &mut tx,
+                &crate::models::NewPartyLedgerEntry {
+                    party_type: crate::models::PartyType::Supplier,
+                    party_id: purchase.supplier_id,
+                    kind: crate::models::PartyEntryKind::Return,
+                    amount: crate::models::PartyEntryKind::Return.signed_amount(total),
+                    document_kind: crate::models::PartyDocumentKind::PurchaseReturn,
+                    document_id: return_id,
+                    entry_date: purchase_return.return_date,
+                    reference: Some(return_number.clone()),
+                    created_by: actor,
+                },
+            )
+            .await?;
+
+        // 6. The document exists from here.
         let confirmed = self
             .returns
             .set_confirmed_in(&mut tx, return_id, actor, &return_number)
@@ -702,9 +779,27 @@ where
     /// cannot underflow by construction — `take` is `min(remaining, ...)` — and
     /// the checked form is what makes that a property of the code rather than a
     /// fact about the caller.
+    async fn parent_allocations(
+        &self,
+        purchase_id: i64,
+        supplier_id: i64,
+    ) -> AppResult<Vec<crate::models::Payment>> {
+        let payments = self
+            .payments
+            .list_allocating_to_target(crate::models::PartyDocumentKind::Purchase, purchase_id)
+            .await?;
+        Ok(payments
+            .into_iter()
+            .filter(|payment| payment.direction == crate::models::PaymentDirection::Out)
+            .filter(|payment| payment.party_type == crate::models::PartyType::Supplier)
+            .filter(|payment| payment.amount > Decimal::ZERO)
+            .filter(|payment| payment.party_id == supplier_id)
+            .collect())
+    }
+
     fn refund_plan(
         total: Decimal,
-        parent_payments: &[crate::models::PurchasePayment],
+        parent_payments: &[crate::models::Payment],
     ) -> AppResult<Vec<RefundPlan>> {
         let mut remaining = total;
         let mut plan = Vec::new();
@@ -778,8 +873,11 @@ where
         // the reason `PurchasesService::cancel` states: without it a reversal
         // would move stock and money and only the read at the end would refuse.
         let lines = self.returns.list_lines(return_id).await?;
-        let payments = self.returns.list_payments(return_id).await?;
-        Self::document_money(&lines, &payments).map_err(AppError::PriceRefused)?;
+        let deliveries = self
+            .payments
+            .list_refunds_for_document(crate::models::PartyDocumentKind::PurchaseReturn, return_id)
+            .await?;
+        Self::document_money(&lines, &deliveries).map_err(AppError::PriceRefused)?;
 
         if purchase_return.status == PurchaseReturnStatus::Draft {
             // Draft -> Cancelled: discard, no stock or finance side effect.
@@ -794,20 +892,30 @@ where
             AppError::Internal("confirmed purchase return missing return_number".into())
         })?;
 
-        // A partially-applied reversal is REFUSED, not doubled: a second pass
-        // would move the goods back in again and reverse every refund twice.
-        let partial = payments
-            .iter()
-            .filter(|p| p.refund_transaction_id.is_some())
-            .count();
-        if partial > 0 {
+        // The parent purchase, for the SUPPLIER the reversal is assigned to. Read here
+        // rather than passed in, and before any write so a missing parent refuses early.
+        let purchase = self.confirmed_parent(purchase_return.purchase_id).await?;
+
+        // The journal is the source for both counts: Refund entries are the
+        // deliveries (M), and Payment entries are reversals already applied (N).
+        let deliveries = self
+            .payments
+            .list_refunds_for_document(crate::models::PartyDocumentKind::PurchaseReturn, return_id)
+            .await?;
+        let reversals = self
+            .payments
+            .count_reversals_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                return_id,
+            )
+            .await?;
+        if reversals > 0 {
             return Err(AppError::Validation(format!(
-                "reversal already partially applied: {partial} of {} refunds already link a reversal; \
+                "reversal already partially applied: {reversals} of {} refunds already link a reversal; \
                  refusing to return the goods a second time or duplicate the reversal",
-                payments.len()
+                deliveries.len()
             )));
         }
-
         let mut tracked: Vec<(PurchaseReturnLine, PurchaseLine)> = Vec::new();
         for line in &lines {
             let parent = self.parent_line(line.purchase_line_id).await?;
@@ -822,7 +930,7 @@ where
                 tracked.push((line.clone(), parent));
             }
         }
-        for pay in &payments {
+        for pay in &deliveries {
             if !self.transactions.accounts.exists(pay.account_id).await? {
                 return Err(AppError::NotFound(format!(
                     "account {} not found",
@@ -831,11 +939,19 @@ where
             }
         }
 
+        // ---- THE WRITE UNIT (T3d) -------------------------------------------
+        //
+        // The stock coming back, the reversal deliveries and the cancellation are ONE
+        // unit. Before, each reversal was posted by `create_with_reference` — a unit of
+        // its own — and only then was the return flipped to Cancelled, so a failure in
+        // between left the money gone and the document still Confirmed.
+        let mut tx = self.returns.pool().begin().await?;
+
         // Stock In: the goods the supplier sent back come back onto the shelf.
-        // The movement carries the cancelling request's actor, like its reversal.
         for (line, parent) in &tracked {
             self.inventory
-                .record_movement(
+                .record_movement_in(
+                    &mut tx,
                     actor,
                     NewMovement {
                         product_id: parent.product_id,
@@ -849,32 +965,53 @@ where
                 .await?;
         }
 
-        // The money leaves again, per originating account, each reversal linked
-        // back from the refund row it reverses. This is the one direction in
-        // which a return's money is an Expense, and it is why a reversal can be
-        // refused for want of funds where the confirm never could.
-        for pay in &payments {
-            let reversal = self
-                .transactions
-                .create_with_reference(
-                    actor,
-                    pay.account_id,
-                    crate::models::TransactionKind::Expense,
-                    pay.amount,
-                    Some(return_number.clone()),
-                    Some(return_number.clone()),
-                    purchase_return.return_date,
-                )
-                .await?;
-            self.returns
-                .set_payment_refund_transaction(actor, pay.id, reversal.id)
-                .await?;
+        // The money leaves again, per originating account, as a delivery that REPLAYS
+        // the account it came from (decision 9). This is the one direction in which a
+        // return's money is an `Expense`, and it is why a reversal can be refused for
+        // want of funds where the confirm never could — the pre-checks above are what
+        // refuse it, before anything is written.
+        // The journal's refund deliveries are the authority for what was refunded
+        // and through which account, so each reversal replays one of them directly.
+        for pay in &deliveries {
+            let reversal_delivery = crate::services::payment_writer::record_delivery_in(
+                &self.sequences,
+                &self.transactions,
+                &self.party_ledger,
+                &self.payments,
+                &mut tx,
+                actor,
+                crate::models::PaymentDirection::Out,
+                crate::models::PartyType::Supplier,
+                purchase.supplier_id,
+                (crate::models::PartyDocumentKind::PurchaseReturn, return_id),
+                pay.method_id,
+                pay.account_id,
+                pay.amount,
+                purchase_return.return_date,
+                Some(format!("cancellation of {return_number}")),
+                Some(return_number.clone()),
+                None,
+                &[],
+            )
+            .await?;
+            // The reversal must have produced its movement, or the unit is broken.
+            // This used to also stamp the legacy row's reversal link; that column is
+            // the journal's now and nothing reads it (P5.3b-3 moved the guard,
+            // P5.3b-5 the detail), so the check stands and the write is gone.
+            if reversal_delivery.transaction_id.is_none() {
+                return Err(AppError::Internal(
+                    "reversal delivery has no movement".into(),
+                ));
+            }
         }
 
         let cancelled = self
             .returns
-            .set_cancelled(return_id, actor, reason.as_deref())
+            .set_cancelled_in(&mut tx, return_id, actor, reason.as_deref())
             .await?;
+
+        tx.commit().await?;
+
         self.detail_for(cancelled).await
     }
 
@@ -926,10 +1063,14 @@ mod tests {
     use super::*;
     use crate::models::{NewProduct, PaymentStatus, ProductKind};
     use crate::repositories::{
-        purchase_return_repo::PurchaseReturnListFilter, PurchaseReturnRepository,
-        SqliteAccountRepository, SqliteBarcodeRepository, SqliteCategoryRepository,
-        SqliteDocSequenceRepository, SqliteProductRepository, SqlitePurchaseRepository,
-        SqlitePurchaseReturnRepository, SqliteStockMovementRepository, SqliteTransactionRepository,
+        purchase_return_repo::PurchaseReturnListFilter, PaymentRepository,
+        PurchaseReturnRepository, SqliteAccountRepository, SqliteBarcodeRepository,
+        SqliteCategoryRepository, SqliteDocSequenceRepository, SqliteProductRepository,
+        SqlitePurchaseRepository, SqlitePurchaseReturnRepository, SqliteStockMovementRepository,
+        SqliteTransactionRepository,
+    };
+    use crate::repositories::{
+        PartyLedgerRepository, SqlitePartyLedgerRepository, SqlitePaymentRepository,
     };
     use crate::security::test_support;
     use crate::services::{InventoryService, TransactionService};
@@ -948,6 +1089,8 @@ mod tests {
         SqliteStockMovementRepository,
         SqliteAccountRepository,
         SqliteTransactionRepository,
+        SqlitePartyLedgerRepository,
+        SqlitePaymentRepository,
     >;
 
     /// `max_connections(1)` is LOAD-BEARING for every test in this module and is
@@ -997,12 +1140,32 @@ mod tests {
                 SqliteTransactionRepository::new(pool.clone()),
                 allow_balance,
             ),
+            SqlitePartyLedgerRepository::new(pool.clone()),
+            SqlitePaymentRepository::new(pool.clone()),
         );
         (s, pool)
     }
 
     async fn svc() -> (Svc, SqlitePool) {
         svc_with_flags(true, true).await
+    }
+
+    /// Migration 49 dropped the table this family used to keep its refunds in,
+    /// and the assertion is the whole point: `sqlx::migrate!` embeds the file at
+    /// COMPILE time, so a stale binary keeps a stale schema and every other test
+    /// in this module would still pass against it. A missing table is checked
+    /// rather than the absence of an error from a query nobody runs.
+    #[tokio::test]
+    async fn the_return_payment_table_is_gone_from_the_schema() {
+        let (_s, pool) = svc().await;
+        let found: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        )
+        .bind("purchase_return_payments")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(found, 0, "migration 49 must have dropped it");
     }
 
     fn dec(s: &str) -> Decimal {
@@ -1105,11 +1268,28 @@ mod tests {
             .unwrap()
     }
 
-    async fn cash_method(pool: &SqlitePool) -> i64 {
-        sqlx::query_scalar("SELECT id FROM payment_methods WHERE name = 'Cash'")
+    /// A method the named account OWNS. Migration 44 guards the
+    /// (account_id, method_id) pair on the payment row, and the seeded methods
+    /// are unassigned on a fresh database, so the fixture builds the pair.
+    async fn owned_method(pool: &SqlitePool, account: i64) -> i64 {
+        match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = 'wallet cash' AND account_id = ?",
+        )
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by)\n                 VALUES ('wallet cash', ?, ?) RETURNING id",
+            )
+            .bind(account)
+            .bind(actor(pool).await)
             .fetch_one(pool)
             .await
-            .unwrap()
+            .unwrap(),
+        }
     }
 
     /// One CONFIRMED purchase carrying one line, seeded through raw SQL because
@@ -1169,9 +1349,30 @@ mod tests {
     /// not a shape the real document path ever produces.
     async fn collect(pool: &SqlitePool, purchase_id: i64, number: &str, amounts: &[(&str, &str)]) {
         let who = actor(pool).await;
-        let method = cash_method(pool).await;
-        for (account_name, amount) in amounts {
+        let supplier_id: i64 = sqlx::query_scalar("SELECT supplier_id FROM purchases WHERE id = ?")
+            .bind(purchase_id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        let lines: Vec<(String, String)> = sqlx::query_as(
+            "SELECT qty, unit_cost FROM purchase_lines WHERE purchase_id = ? ORDER BY id",
+        )
+        .bind(purchase_id)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let mut charge = Decimal::ZERO;
+        for (qty, unit_cost) in lines {
+            let line_total = Decimal::from_str(&qty)
+                .unwrap()
+                .checked_mul(Decimal::from_str(&unit_cost).unwrap())
+                .unwrap();
+            charge = charge.checked_add(line_total).unwrap();
+        }
+        let mut allocated = Decimal::ZERO;
+        for (index, (account_name, amount)) in amounts.iter().enumerate() {
             let account = seed_account(pool, account_name).await;
+            let method = owned_method(pool, account).await;
             let tx: i64 = sqlx::query_scalar(
                 r#"INSERT INTO transactions (account_id, kind, amount, description, reference, date, created_by)
                    VALUES (?, 'Expense', ?, 'paid the supplier', ?, ?, ?) RETURNING id"#,
@@ -1198,6 +1399,35 @@ mod tests {
             .execute(pool)
             .await
             .unwrap();
+            let payment_id: i64 = sqlx::query_scalar(
+                "INSERT INTO payments (number, direction, party_type, party_id, method_id, account_id, amount, date, transaction_id, created_by) VALUES (?, 'Out', 'Supplier', ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+            )
+            .bind(format!("TEST-PAY-{purchase_id}-{index}"))
+            .bind(supplier_id)
+            .bind(method)
+            .bind(account)
+            .bind(dec(amount).to_string())
+            .bind(purchase_date())
+            .bind(tx)
+            .bind(who)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            let remaining = charge.checked_sub(allocated).unwrap();
+            let share = dec(amount).min(remaining);
+            if share > Decimal::ZERO {
+                sqlx::query(
+                    "INSERT INTO payment_allocations (payment_id, target_kind, target_id, amount, created_by) VALUES (?, 'Purchase', ?, ?, ?)",
+                )
+                .bind(payment_id)
+                .bind(purchase_id)
+                .bind(share.to_string())
+                .bind(who)
+                .execute(pool)
+                .await
+                .unwrap();
+                allocated = allocated.checked_add(share).unwrap();
+            }
         }
     }
 
@@ -1233,6 +1463,282 @@ mod tests {
             purchase_line_id: line,
             return_id: purchase_return.id,
         }
+    }
+
+    /// **T3d on the purchase-return side**, the one direction where a reversal is an
+    /// `Expense` and can be refused for want of funds.
+    #[tokio::test]
+    async fn a_failure_while_cancelling_a_purchase_return_rolls_the_reversals_back() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "T3D-PR-ATOMIC",
+            "T3D PR Atomic Supplier",
+            "2",
+            "5",
+            &[("t3d pr till", "10")],
+            "2",
+        )
+        .await;
+        s.confirm(actor(&pool).await, p.return_id).await.unwrap();
+
+        let tx_before = tx_count(&pool).await;
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_cancel_failure BEFORE UPDATE ON purchase_returns \
+             WHEN NEW.status = 'Cancelled' \
+             BEGIN SELECT RAISE(ABORT, 'injected failure after the reversals'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .cancel(actor(&pool).await, p.return_id, Some("injected".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+        assert_eq!(
+            tx_count(&pool).await,
+            tx_before,
+            "the reversal movement must die with the unit"
+        );
+        // The refund delivery's reversal, counted where it now lives: the
+        // journal. `payment_repo` reads it as `count_reversals_for_document`,
+        // and the same SQL is inlined here on purpose — a test that reaches for
+        // the production method would pass even if that method stopped looking
+        // at the rows this test is about.
+        let reversals: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM party_ledger_entries \
+             WHERE kind = 'Payment' AND document_kind = 'PurchaseReturn' AND document_id = ?",
+        )
+        .bind(p.return_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(reversals, 0, "and no entry claims one");
+    }
+
+    // -- the party ledger (T2) ---------------------------------------------------
+
+    /// The journal rows this return wrote, as the sign rule stored them.
+    async fn ledger_rows(pool: &SqlitePool, document_id: i64) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT kind, amount FROM party_ledger_entries \
+             WHERE document_kind = 'PurchaseReturn' AND document_id = ? ORDER BY id",
+        )
+        .bind(document_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A purchase return journals goods as Return and each cash delivery as Refund.
+    #[tokio::test]
+    async fn a_confirmed_purchase_return_appends_one_return_on_the_supplier() {
+        let (s, pool) = svc().await;
+        // Two units at 5 is 10, and the whole 10 was paid, so the refund plan is
+        // full and the cap is not what this test is about.
+        let p = draft_return(
+            &s,
+            &pool,
+            "LEDGER-PR",
+            "Ledger PR Supplier",
+            "2",
+            "5",
+            &[("ledger pr till", "10")],
+            "2",
+        )
+        .await;
+
+        s.confirm(actor(&pool).await, p.return_id).await.unwrap();
+
+        assert_eq!(
+            ledger_rows(&pool, p.return_id).await,
+            vec![
+                ("Refund".to_string(), "10".to_string()),
+                ("Return".to_string(), "-10".to_string()),
+            ],
+            "goods reduce the payable and cash returned settles that amount"
+        );
+    }
+
+    /// A fully paid credit purchase returned in cash has four named ledger
+    /// movements and nets to zero, mirroring the customer-side identity.
+    #[tokio::test]
+    async fn a_fully_paid_purchase_refunded_by_purchase_return_folds_to_zero() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "LEDGER-IDENTITY",
+            "Ledger Identity Supplier",
+            "2",
+            "6",
+            &[("identity supplier till", "12")],
+            "2",
+        )
+        .await;
+        let (purchase_id, supplier_id): (i64, i64) =
+            sqlx::query_as("SELECT purchase_id, supplier_id FROM purchase_returns WHERE id = ?")
+                .bind(p.return_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let ledger = SqlitePartyLedgerRepository::new(pool.clone());
+        let who = actor(&pool).await;
+        for (kind, amount) in [
+            (crate::models::PartyEntryKind::Charge, dec("12")),
+            (crate::models::PartyEntryKind::Payment, dec("12")),
+        ] {
+            ledger
+                .insert(&crate::models::NewPartyLedgerEntry {
+                    party_type: crate::models::PartyType::Supplier,
+                    party_id: supplier_id,
+                    kind,
+                    amount: kind.signed_amount(amount),
+                    document_kind: crate::models::PartyDocumentKind::Purchase,
+                    document_id: purchase_id,
+                    entry_date: purchase_date(),
+                    reference: Some("2024-PURCH-LEDGER-IDENTITY".into()),
+                    created_by: who,
+                })
+                .await
+                .unwrap();
+        }
+
+        s.confirm(who, p.return_id).await.unwrap();
+
+        let rows: Vec<(String, String, String, i64)> = sqlx::query_as(
+            "SELECT kind, amount, document_kind, document_id FROM party_ledger_entries \
+             WHERE party_type = 'Supplier' AND party_id = ? ORDER BY id",
+        )
+        .bind(supplier_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("Charge".into(), "12".into(), "Purchase".into(), purchase_id),
+                (
+                    "Payment".into(),
+                    "-12".into(),
+                    "Purchase".into(),
+                    purchase_id
+                ),
+                (
+                    "Refund".into(),
+                    "12".into(),
+                    "PurchaseReturn".into(),
+                    p.return_id,
+                ),
+                (
+                    "Return".into(),
+                    "-12".into(),
+                    "PurchaseReturn".into(),
+                    p.return_id,
+                ),
+            ],
+            "the journal names all four obligation movements on their owning documents"
+        );
+        let balance = SqlitePartyLedgerRepository::new(pool.clone())
+            .balance_for_party(crate::models::PartyType::Supplier, supplier_id)
+            .await
+            .unwrap();
+        assert_eq!(balance, Decimal::ZERO);
+    }
+
+    /// THE case the empty refund plan exists for: a purchase confirmed but NOT
+    /// paid still returns goods, so the payable comes down while no money moves.
+    /// An implementation that wrote the entry only alongside a refund would leave
+    /// the shop owing for goods it sent back.
+    #[tokio::test]
+    async fn an_unpaid_parent_still_returns_the_payable_with_no_refund() {
+        let (s, pool) = svc().await;
+        // Nothing paid: the fixture's refund plan is empty.
+        let p = draft_return(
+            &s,
+            &pool,
+            "LEDGER-PR-UNPAID",
+            "Ledger PR Unpaid Supplier",
+            "2",
+            "5",
+            &[],
+            "2",
+        )
+        .await;
+
+        s.confirm(actor(&pool).await, p.return_id).await.unwrap();
+
+        assert_eq!(
+            ledger_rows(&pool, p.return_id).await,
+            vec![("Return".to_string(), "-10".to_string())],
+            "the goods went back, so the payable comes down; the empty refund plan adds no Refund"
+        );
+        assert_eq!(
+            tx_count(&pool).await,
+            0,
+            "and no cash entry exists: the Return is about the goods, not the money"
+        );
+        let supplier_id: i64 =
+            sqlx::query_scalar("SELECT supplier_id FROM purchase_returns WHERE id = ?")
+                .bind(p.return_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let balance = SqlitePartyLedgerRepository::new(pool.clone())
+            .balance_for_party(crate::models::PartyType::Supplier, supplier_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            balance,
+            dec("-10"),
+            "without a Charge or refund, the sole Return is the supplier's balance"
+        );
+    }
+
+    /// The write joins the caller's unit, so a failure after it takes the entry
+    /// with it.
+    #[tokio::test]
+    async fn a_failed_purchase_return_confirm_rolls_its_return_entry_back() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "LEDGER-PR-RB",
+            "Ledger PR Rollback Supplier",
+            "2",
+            "5",
+            &[("ledger pr rb till", "10")],
+            "2",
+        )
+        .await;
+
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_ledger_probe BEFORE UPDATE ON purchase_returns \
+             WHEN NEW.status = 'Confirmed' \
+             BEGIN SELECT RAISE(ABORT, 'injected failure after the ledger write'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .confirm(actor(&pool).await, p.return_id)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+        assert!(
+            ledger_rows(&pool, p.return_id).await.is_empty(),
+            "the entry must die with the unit that wrote it"
+        );
     }
 
     // -- the residue tables, read straight from the database -----------------
@@ -1274,12 +1780,16 @@ mod tests {
             .unwrap()
     }
 
+    /// How many refund rows this family has written, read from the journal that
+    /// owns the fact since P5.3b-2: one `Refund` entry per refund delivery.
     async fn payment_count(pool: &SqlitePool) -> i64 {
-        sqlx::query_as::<_, (i64,)>("SELECT COUNT(*) FROM purchase_return_payments")
-            .fetch_one(pool)
-            .await
-            .unwrap()
-            .0
+        sqlx::query_as::<_, (i64,)>(
+            "SELECT COUNT(*) FROM party_ledger_entries WHERE kind = 'Refund' AND document_kind = 'PurchaseReturn'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap()
+        .0
     }
 
     /// What `next_number` actually spent. `None` means the `doc_sequences` row
@@ -1408,16 +1918,39 @@ mod tests {
             vec!["Expense", "Income"],
             "the parent's own payment was an Expense; the refund is an Income"
         );
+        // The refund delivery the journal resolves for this return is the one that
+        // claims the movement: the journal read replaced the legacy row this
+        // used to inspect.
+        let delivery = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the return has one refund delivery");
+        let delivery_number: String =
+            sqlx::query_scalar("SELECT number FROM payments WHERE transaction_id = ?")
+                .bind(delivery.transaction_id.unwrap())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(
             tx_references(&pool).await,
-            vec!["2024-PURCH-BASE", "2024-PRET-000001"],
-            "the refund is stamped with the RETURN's own number, not the parent's"
+            vec!["2024-PURCH-BASE".to_string(), delivery_number.clone()],
+            "the reference names the delivery (decision 5); the return number is the movement description and Refund locator"
+        );
+        assert_ne!(
+            delivery_number, "2024-PURCH-BASE",
+            "the refund movement is not stamped with the parent's number"
         );
         assert_eq!(payment_count(&pool).await, 1);
-        assert_eq!(
-            detail.payments[0].transaction_id.is_some(),
-            true,
-            "the refund row claims the finance row it produced"
+        assert!(
+            delivery.transaction_id.is_some(),
+            "the refund delivery claims the finance row it produced"
         );
 
         // The number was taken in the return's own year under the short prefix.
@@ -1430,6 +1963,77 @@ mod tests {
             PurchaseReturnStatus::Confirmed
         );
         assert_eq!(pret_sequence_last(&pool).await, Some(1));
+    }
+
+    /// The refund-table EXEMPTION from migration 44, proved end to end: a
+    /// refund does not CHOOSE a pair, it REPLAYS the parent payment's pair
+    /// (`RefundPlan` copies pay.account_id / pay.method_id). After the method
+    /// is re-pointed to ANOTHER account, the return still confirms and the
+    /// money comes back out of the box it went into — the method's current
+    /// owner never receives it.
+    #[tokio::test]
+    async fn a_refund_replays_the_parent_payments_account_even_after_the_method_is_repointed() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "HISTORY",
+            "History Supplier",
+            "3",
+            "4",
+            &[("history wallet", "12")],
+            "3",
+        )
+        .await;
+        let who = actor(&pool).await;
+        // Re-point the collected method to another account: from here on the
+        // method's current owner is NOT the box the money went into.
+        sqlx::query("INSERT INTO accounts (name, created_by) VALUES ('other box', ?) RETURNING id")
+            .bind(who)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE payment_methods SET account_id = (SELECT id FROM accounts WHERE name = 'other box') WHERE name = 'wallet cash'",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        s.confirm(who, p.return_id).await.unwrap();
+
+        // The refund row keeps the PARENT payment's account — the historical
+        // fact of where the money landed.
+        let (wallet_account,): (i64,) =
+            sqlx::query_as("SELECT id FROM accounts WHERE name = 'history wallet'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        // The account comes from the journal's refund delivery, which is where the
+        // replayed pair lives since the legacy rows stopped being written.
+        let (refund_account,): (i64,) = sqlx::query_as(
+            "SELECT p.account_id FROM party_ledger_entries e \
+             JOIN payments p ON p.number = e.reference \
+             WHERE e.kind = 'Refund' AND e.document_kind = 'PurchaseReturn' AND e.document_id = ?",
+        )
+        .bind(p.return_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            refund_account, wallet_account,
+            "the money goes back out of the box it went into"
+        );
+        // The refund's own finance row lands in that same historical account.
+        let (income_account,): (i64,) =
+            sqlx::query_as("SELECT account_id FROM transactions WHERE kind = 'Income'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            income_account, wallet_account,
+            "the refund Income is stamped with the historical account"
+        );
     }
 
     /// A return is a document about a document that EXISTS. A Draft parent has
@@ -1871,7 +2475,19 @@ mod tests {
             PurchaseReturnStatus::Confirmed,
             "the goods still went back: an unpaid parent is not a reason to keep them"
         );
-        assert!(detail.payments.is_empty(), "there was nothing to refund");
+        // The journal resolves no refund delivery for this note, which is the same
+        // fact the legacy field used to carry: there was nothing to refund.
+        assert!(
+            s.payments
+                .list_refunds_for_document(
+                    crate::models::PartyDocumentKind::PurchaseReturn,
+                    p.return_id,
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "there was nothing to refund"
+        );
         assert_eq!(payment_count(&pool).await, 0);
         assert_eq!(
             tx_count(&pool).await,
@@ -1979,20 +2595,43 @@ mod tests {
         let detail = s.confirm(who, purchase_return.id).await.unwrap();
 
         assert_eq!(detail.total, dec("10"));
-        assert_eq!(
-            detail.payments.len(),
-            2,
-            "one refund per originating account"
-        );
-        let mut amounts: Vec<Decimal> = detail.payments.iter().map(|p| p.amount).collect();
+        // The split is read from the journal, which is where the deliveries live
+        // now: one refund per originating account.
+        let deliveries = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                purchase_return.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 2, "one refund per originating account");
+        let mut amounts: Vec<Decimal> = deliveries.iter().map(|p| p.amount).collect();
         amounts.sort();
         assert_eq!(amounts, vec![dec("4"), dec("6")]);
+        assert_eq!(
+            ledger_rows(&pool, purchase_return.id).await,
+            vec![
+                ("Refund".to_string(), "4".to_string()),
+                ("Refund".to_string(), "6".to_string()),
+                ("Return".to_string(), "-10".to_string()),
+            ],
+            "the split refund plan writes one return-located Refund for each delivery"
+        );
 
-        let accounts: Vec<i64> =
-            sqlx::query_scalar("SELECT account_id FROM purchase_return_payments ORDER BY id")
-                .fetch_all(&pool)
-                .await
-                .unwrap();
+        // The accounts come from the deliveries the journal resolves, which is where
+        // the split lives since the legacy rows stopped being written.
+        let accounts: Vec<i64> = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                purchase_return.id,
+            )
+            .await
+            .unwrap()
+            .iter()
+            .map(|p| p.account_id)
+            .collect();
         assert_eq!(accounts.len(), 2);
         assert_ne!(
             accounts[0], accounts[1],
@@ -2006,8 +2645,7 @@ mod tests {
              WHERE NOT EXISTS (SELECT 1 FROM purchase_payments pp WHERE pp.transaction_id = t.id \
                                OR pp.refund_transaction_id = t.id \
                                OR pp.refund_transaction_id IS NULL AND pp.transaction_id IS NULL) \
-             AND NOT EXISTS (SELECT 1 FROM purchase_return_payments rp WHERE rp.transaction_id = t.id \
-                               OR rp.refund_transaction_id = t.id)",
+             AND NOT EXISTS (SELECT 1 FROM payments p WHERE p.transaction_id = t.id)",
         )
         .fetch_one(&pool)
         .await
@@ -2663,9 +3301,32 @@ mod tests {
             vec!["Expense", "Income", "Expense"],
             "the Income the refund produced is now reversed by an Expense"
         );
+        // "BOTH links" is now two journal facts, and both are asserted so neither
+        // half can rot: the refund delivery the journal resolves claims the
+        // movement it produced, AND the reversal it was answered by is recorded.
+        let refund_deliveries = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(refund_deliveries.len(), 1);
         assert!(
-            detail.payments[0].refund_transaction_id.is_some(),
-            "the refund row carries BOTH links: the one it produced and the one that reverses it"
+            refund_deliveries[0].transaction_id.is_some(),
+            "the refund delivery claims the movement it produced"
+        );
+        assert_eq!(
+            s.payments
+                .count_reversals_for_document(
+                    crate::models::PartyDocumentKind::PurchaseReturn,
+                    p.return_id,
+                )
+                .await
+                .unwrap(),
+            1,
+            "and the refund carries BOTH links: the one it produced and the one that reverses it"
         );
 
         // A second cancel is refused rather than doubling the reversal.
@@ -2681,6 +3342,204 @@ mod tests {
             3,
             "nothing moved a second time"
         );
+    }
+
+    #[tokio::test]
+    async fn a_refund_entry_that_is_not_a_payment_number_is_refused_rather_than_dropped() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "BACKFILL-REF",
+            "Backfill Reference Supplier",
+            "3",
+            "4",
+            &[("backfill reference wallet", "12")],
+            "2",
+        )
+        .await;
+        let who = actor(&pool).await;
+        s.confirm(who, p.return_id).await.unwrap();
+
+        let (supplier_id, document_number): (i64, String) =
+            sqlx::query_as("SELECT supplier_id, return_number FROM purchase_returns WHERE id = ?")
+                .bind(p.return_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let normal = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(normal.len(), 1, "the payment-number reference resolves");
+
+        // The T1 backfill shape uses the document number in reference, not the
+        // payment number. The journal is append-only, so exercise it with INSERT.
+        sqlx::query(
+            "INSERT INTO party_ledger_entries \
+             (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by) \
+             VALUES ('Supplier', ?, 'Refund', '1', 'PurchaseReturn', ?, '2024-06-01', ?, ?)",
+        )
+        .bind(supplier_id)
+        .bind(p.return_id)
+        .bind(&document_number)
+        .bind(who)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap_err();
+        match err {
+            AppError::Internal(message) => {
+                assert!(message.contains("2 Refund journal entries"), "{message}");
+                assert!(
+                    message.contains("1 payment deliveries resolved"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("reference may not be a payment number"),
+                    "{message}"
+                );
+                assert!(message.contains("T1 backfill"), "{message}");
+            }
+            other => panic!("expected internal inconsistency, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tolerant_refund_display_returns_resolved_rows_and_reports_backfill_entries_while_strict_read_refuses(
+    ) {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "BACKFILL-TOLERANT",
+            "Tolerant Backfill Supplier",
+            "3",
+            "4",
+            &[("tolerant backfill wallet", "12")],
+            "2",
+        )
+        .await;
+        let who = actor(&pool).await;
+        s.confirm(who, p.return_id).await.unwrap();
+        let (supplier_id, document_number): (i64, String) =
+            sqlx::query_as("SELECT supplier_id, return_number FROM purchase_returns WHERE id = ?")
+                .bind(p.return_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO party_ledger_entries \
+             (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by) \
+             VALUES ('Supplier', ?, 'Refund', '1', 'PurchaseReturn', ?, '2024-06-01', ?, ?)",
+        )
+        .bind(supplier_id)
+        .bind(p.return_id)
+        .bind(document_number)
+        .bind(who)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tolerant = s
+            .payments
+            .list_refunds_for_document_tolerant(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            tolerant.payments.len(),
+            1,
+            "the resolvable delivery remains visible"
+        );
+        assert_eq!(
+            tolerant.unresolved_entries, 1,
+            "the backfill-shaped entry is reported"
+        );
+        assert!(
+            s.payments
+                .list_refunds_for_document(
+                    crate::models::PartyDocumentKind::PurchaseReturn,
+                    p.return_id,
+                )
+                .await
+                .is_err(),
+            "the strict decision read continues to refuse partial history"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_purchase_return_refuses_a_journal_recorded_partial_reversal() {
+        let (s, pool) = svc().await;
+        let p = draft_return(
+            &s,
+            &pool,
+            "PARTIAL-CANCEL",
+            "Partial Cancel Supplier",
+            "3",
+            "4",
+            &[("partial cancel wallet", "12")],
+            "2",
+        )
+        .await;
+        let who = actor(&pool).await;
+        s.confirm(who, p.return_id).await.unwrap();
+        let stock_before = s.inventory.stock_for_decision(p.product_id).await.unwrap();
+        let transactions_before = tx_count(&pool).await;
+        let supplier_id: i64 =
+            sqlx::query_scalar("SELECT supplier_id FROM purchase_returns WHERE id = ?")
+                .bind(p.return_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO party_ledger_entries \
+             (party_type, party_id, kind, amount, document_kind, document_id, entry_date, reference, created_by) \
+             VALUES ('Supplier', ?, 'Payment', '-12', 'PurchaseReturn', ?, '2024-06-01', 'simulated reversal', ?)",
+        )
+        .bind(supplier_id)
+        .bind(p.return_id)
+        .bind(who)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        for _ in 0..2 {
+            match s.cancel(who, p.return_id, None).await.unwrap_err() {
+                AppError::Validation(msg) => {
+                    assert!(
+                        msg.contains("1 of 1"),
+                        "the journal residual is counted: {msg}"
+                    );
+                    assert!(msg.contains("already partially applied"), "{msg}");
+                }
+                other => panic!("expected Validation, got {other:?}"),
+            }
+            assert_eq!(
+                s.inventory.stock_for_decision(p.product_id).await.unwrap(),
+                stock_before,
+                "a refused retry must not move the goods again"
+            );
+            assert_eq!(
+                tx_count(&pool).await,
+                transactions_before,
+                "a refused retry must not reverse money again"
+            );
+        }
     }
 
     /// A Draft return is discarded, not reversed: it never moved goods or money,
@@ -2995,8 +3854,10 @@ mod tests {
         inject(
             &pool,
             format!(
-                "CREATE TRIGGER ret_w3 BEFORE INSERT ON purchase_return_payments \
-                 WHEN NEW.return_id = {return_id} \
+                "CREATE TRIGGER ret_w3 BEFORE INSERT ON payments \
+                 WHEN NEW.direction = 'In' AND NEW.party_id = ( \
+                     SELECT pu.supplier_id FROM purchase_returns pr \
+                     JOIN purchases pu ON pu.id = pr.purchase_id WHERE pr.id = {return_id}) \
                  BEGIN SELECT RAISE(ABORT, 'injected payment-row failure'); END"
             ),
         )
@@ -3028,8 +3889,7 @@ mod tests {
         // The shape the confirm used to leave, asserted absent by name.
         let orphans: (i64,) = sqlx::query_as(
             "SELECT COUNT(*) FROM transactions t \
-             WHERE NOT EXISTS (SELECT 1 FROM purchase_return_payments rp WHERE rp.transaction_id = t.id \
-                               OR rp.refund_transaction_id = t.id) \
+             WHERE NOT EXISTS (SELECT 1 FROM payments p WHERE p.transaction_id = t.id) \
                AND NOT EXISTS (SELECT 1 FROM purchase_payments pp WHERE pp.transaction_id = t.id \
                                OR pp.refund_transaction_id = t.id)",
         )
@@ -3200,7 +4060,7 @@ mod tests {
 
         inject(
             &pool,
-            "CREATE TRIGGER ret_retry BEFORE INSERT ON purchase_return_payments \
+            "CREATE TRIGGER ret_retry BEFORE INSERT ON payments \
              BEGIN SELECT RAISE(ABORT, 'injected retry failure'); END"
                 .to_string(),
         )

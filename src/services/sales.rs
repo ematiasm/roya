@@ -59,6 +59,7 @@ use crate::models::{
     SaleListFilter, SaleListRow, SalePayment, SalePaymentView, SaleRecord, SetMoney,
     StatementEntry, StatementEntryKind, UpdateSaleDraft,
 };
+use crate::repositories::payment_repo::DocumentResidualParts;
 use crate::repositories::{
     AccountRepository, BarcodeRepository, CategoryRepository, CustomerRepository,
     DocSequenceRepository, PaymentMethodRepository, ProductRepository, SaleRepository,
@@ -71,7 +72,7 @@ use crate::services::{checked_money_add, checked_money_sum, CustomerService};
 pub const DEBT_BANNER_LIMIT: usize = 5;
 
 #[derive(Clone)]
-pub struct SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS>
+pub struct SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
 where
     SR: SaleRepository,
     DR: DocSequenceRepository,
@@ -84,6 +85,8 @@ where
     PM: PaymentMethodRepository,
     CR: CustomerRepository,
     TS: crate::repositories::TaxSnapshotRepository,
+    PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub sales: SR,
     pub sequences: DR,
@@ -100,9 +103,21 @@ where
     /// `ENFORCE_CREDIT_LIMIT`: when false an over-limit credit sale is confirmed
     /// and the interface reports the customer as over limit instead.
     pub enforce_credit_limit: bool,
+    /// The customer's signed journal (T2). `confirm` appends the `Charge` that
+    /// makes the sale a debt, inside the SAME unit that writes the document —
+    /// which is the whole point of the ledger: the balance is the fold of these
+    /// rows, so an entry that committed separately from its document would be a
+    /// balance that moved without a document, or a document with no balance.
+    pub party_ledger: PL,
+    /// The `payments` family (P3): the delivery-of-money document, its shares and
+    /// its cap. A second field rather than folding it into `party_ledger`, because
+    /// they are two tables with two rules: the journal is append-only and the
+    /// balance IS its fold, while a payment's shares are mutable and capped.
+    pub payments: PY,
 }
 
-impl<SR, DR, C, P, B, S, A, T, PM, CR, TS> SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS>
+impl<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
+    SalesService<SR, DR, C, P, B, S, A, T, PM, CR, TS, PL, PY>
 where
     SR: SaleRepository,
     DR: DocSequenceRepository,
@@ -115,6 +130,8 @@ where
     PM: PaymentMethodRepository,
     CR: CustomerRepository,
     TS: crate::repositories::TaxSnapshotRepository,
+    PL: crate::repositories::PartyLedgerRepository,
+    PY: crate::repositories::PaymentRepository,
 {
     pub fn new(
         sales: SR,
@@ -125,6 +142,8 @@ where
         customers: CustomerService<CR>,
         tax_snapshots: TS,
         enforce_credit_limit: bool,
+        party_ledger: PL,
+        payments: PY,
     ) -> Self {
         Self {
             sales,
@@ -135,12 +154,22 @@ where
             tax_snapshots,
             customers,
             enforce_credit_limit,
+            party_ledger,
+            payments,
         }
     }
 
-    async fn resolve_method_account(&self, method_id: i64) -> AppResult<i64> {
-        crate::services::finance_methods::resolve_account_for(&self.payment_methods, method_id)
-            .await
+    async fn resolve_method_account(
+        &self,
+        method_id: i64,
+        stated_account_id: Option<i64>,
+    ) -> AppResult<i64> {
+        crate::services::finance_methods::resolve_account_for(
+            &self.payment_methods,
+            method_id,
+            stated_account_id,
+        )
+        .await
     }
 
     // -- validation helpers -------------------------------------------------
@@ -264,25 +293,21 @@ where
         Ok((net, tax, total))
     }
 
-    /// What a document has been paid and what is still owed. Checked for the same
-    /// reason [`Self::tax_split`] is: it is a sum of stored amounts, and the
-    /// payment ceiling that keeps `paid <= total` is enforced by the service's
-    /// own write path, not by the column. `total - paid` is checked too, so the
-    /// due balance is a fact the code can state rather than one it assumes.
+    /// The applied amount and amount still owed come from the allocation-based
+    /// residual. Both are already checked by the payment repository's shared
+    /// residual fold; keep the document total in this signature so an unstated
+    /// total still refuses rather than publishing partial money.
     fn paid_and_due(
         total: Decimal,
-        payments: &[SalePayment],
+        residual: &DocumentResidualParts,
     ) -> Result<(Decimal, Decimal), PriceRefusal> {
-        let mut paid = Decimal::ZERO;
-        for p in payments {
-            paid = paid
-                .checked_add(p.amount)
-                .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
+        if residual.charge == Decimal::ZERO
+            && residual.signed_returns == Decimal::ZERO
+            && residual.allocated == Decimal::ZERO
+        {
+            return Ok((Decimal::ZERO, total));
         }
-        let due = total
-            .checked_sub(paid)
-            .ok_or(PriceRefusal::DocumentTotalTooLarge)?;
-        Ok((paid, due))
+        Ok((residual.allocated, residual.residual))
     }
 
     /// The whole document-level money as ONE value, or the rule that refused it.
@@ -296,10 +321,10 @@ where
     /// that does not exist.
     fn document_money(
         lines: &[SaleLine],
-        payments: &[SalePayment],
+        residual: &DocumentResidualParts,
     ) -> Result<RecordMoney, PriceRefusal> {
         let (net_subtotal, tax_total, total) = Self::tax_split(lines)?;
-        let (paid, due) = Self::paid_and_due(total, payments)?;
+        let (paid, due) = Self::paid_and_due(total, residual)?;
         Ok(RecordMoney {
             net_subtotal,
             tax_total,
@@ -319,8 +344,12 @@ where
     /// taking every other document on the page with it. Both call the same
     /// checked [`Self::document_money`], so they cannot disagree about which
     /// documents are refusable.
-    fn row_for(sale: Sale, lines: &[SaleLine], payments: &[SalePayment]) -> SaleListRow {
-        let (money, total_refusal) = match Self::document_money(lines, payments) {
+    fn row_for(
+        sale: Sale,
+        lines: &[SaleLine],
+        residual: &DocumentResidualParts,
+    ) -> SaleListRow {
+        let (money, total_refusal) = match Self::document_money(lines, residual) {
             Ok(money) => (Some(money), None),
             Err(refusal) => (None, Some(refusal)),
         };
@@ -359,9 +388,9 @@ where
     /// against the money the customer actually owes.
     fn totals(
         lines: &[SaleLine],
-        payments: &[SalePayment],
+        residual: &DocumentResidualParts,
     ) -> Result<(Decimal, Decimal, Decimal), PriceRefusal> {
-        let money = Self::document_money(lines, payments)?;
+        let money = Self::document_money(lines, residual)?;
         Ok((money.total, money.paid, money.due))
     }
 
@@ -379,8 +408,9 @@ where
         sale: Sale,
         lines: Vec<SaleLine>,
         payments: Vec<SalePayment>,
+        residual: &DocumentResidualParts,
     ) -> AppResult<SaleDetail> {
-        let money = Self::document_money(&lines, &payments).map_err(AppError::PriceRefused)?;
+        let money = Self::document_money(&lines, residual).map_err(AppError::PriceRefused)?;
         Ok(SaleDetail {
             sale,
             lines,
@@ -394,10 +424,36 @@ where
         })
     }
 
+    async fn residual_for_read(&self, sale: &Sale) -> AppResult<DocumentResidualParts> {
+        match self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &[sale.id])
+            .await
+        {
+            Ok(mut residuals) => residuals
+                .remove(&sale.id)
+                .ok_or_else(|| AppError::Internal("sale residual missing from batch".into())),
+            // The record view must remain readable when its own document total
+            // refuses; document_money independently states that same refusal.
+            Err(AppError::PriceRefused(_)) => Ok(Self::empty_residual()),
+            Err(error) => Err(error),
+        }
+    }
+
     async fn detail_for(&self, sale: Sale) -> AppResult<SaleDetail> {
         let lines = self.sales.list_lines(sale.id).await?;
         let payments = self.sales.list_payments(sale.id).await?;
-        Self::assemble_detail(sale, lines, payments)
+        let residual = self.residual_for_read(&sale).await?;
+        Self::assemble_detail(sale, lines, payments, &residual)
+    }
+
+    fn empty_residual() -> DocumentResidualParts {
+        DocumentResidualParts {
+            charge: Decimal::ZERO,
+            signed_returns: Decimal::ZERO,
+            allocated: Decimal::ZERO,
+            residual: Decimal::ZERO,
+        }
     }
 
     fn ensure_draft(sale: &Sale) -> AppResult<()> {
@@ -592,6 +648,11 @@ where
             .find_sale(sale_id)
             .await?
             .ok_or_else(|| AppError::NotFound(format!("sale {sale_id} not found")))?;
+        if sale.status != crate::models::SaleStatus::Confirmed {
+            let lines = self.sales.list_lines(sale.id).await?;
+            let payments = self.sales.list_payments(sale.id).await?;
+            return Self::assemble_detail(sale, lines, payments, &Self::empty_residual());
+        }
         self.detail_for(sale).await
     }
 
@@ -622,7 +683,8 @@ where
             .ok_or_else(|| AppError::NotFound(format!("sale {sale_id} not found")))?;
         let lines = self.sales.list_lines(sale.id).await?;
         let payments = self.sales.list_payments(sale.id).await?;
-        self.record_from_parts(sale, lines, payments).await
+        let residual = self.residual_for_read(&sale).await?;
+        self.record_from_parts(sale, lines, payments, &residual).await
     }
 
     /// The one read that renders a document whose money cannot be computed.
@@ -639,12 +701,13 @@ where
         sale: Sale,
         stored_lines: Vec<SaleLine>,
         stored_payments: Vec<SalePayment>,
+        residual: &DocumentResidualParts,
     ) -> AppResult<SaleRecord> {
         // Resolved BEFORE the children are consumed below, and it is the only
         // thing that can fail: every name, tax snapshot and amount this view
         // shows is a fact about ONE line, and a line's own money is
         // representable.
-        let (money, total_refusal) = match Self::document_money(&stored_lines, &stored_payments) {
+        let (money, total_refusal) = match Self::document_money(&stored_lines, residual) {
             Ok(money) => (Some(money), None),
             Err(refusal) => (None, Some(refusal)),
         };
@@ -736,24 +799,63 @@ where
         Ok(out)
     }
 
-    /// The same documents as [`Self::list_details`], as LIST ROWS for the pages
-    /// that must render a document whose total cannot be computed. A refused
-    /// document keeps its place in the list; the read never fails because of one.
-    pub async fn list_rows(&self) -> AppResult<Vec<SaleListRow>> {
-        let sales = self.sales.list_sales().await?;
-        let mut out = Vec::with_capacity(sales.len());
+    async fn rows_with_residuals(&self, sales: Vec<Sale>) -> AppResult<Vec<SaleListRow>> {
+        let mut documents = Vec::with_capacity(sales.len());
+        let mut ids = Vec::new();
         for sale in sales {
-            out.push(self.row_of(sale).await?);
+            let lines = self.sales.list_lines(sale.id).await?;
+            let total_is_readable = Self::tax_split(&lines).is_ok();
+            if sale.status == crate::models::SaleStatus::Confirmed && total_is_readable {
+                ids.push(sale.id);
+            }
+            documents.push((sale, lines, total_is_readable));
+        }
+        let residuals = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &ids)
+            .await?;
+        let mut out = Vec::with_capacity(documents.len());
+        for (sale, lines, total_is_readable) in documents {
+            if !total_is_readable {
+                out.push(SaleListRow {
+                    sale,
+                    money: None,
+                    total_refusal: Some(PriceRefusal::DocumentTotalTooLarge),
+                });
+                continue;
+            }
+            let empty = DocumentResidualParts {
+                charge: Decimal::ZERO,
+                signed_returns: Decimal::ZERO,
+                allocated: Decimal::ZERO,
+                residual: Decimal::ZERO,
+            };
+            let has_payment_residual = sale.status == crate::models::SaleStatus::Confirmed;
+            let residual = if has_payment_residual {
+                residuals.get(&sale.id).unwrap_or(&empty)
+            } else {
+                &empty
+            };
+            out.push(Self::row_for(sale, &lines, residual));
         }
         Ok(out)
     }
 
-    /// One document's children, read the way [`Self::detail_for`] reads them, and
-    /// the row built from them.
-    async fn row_of(&self, sale: Sale) -> AppResult<SaleListRow> {
-        let lines = self.sales.list_lines(sale.id).await?;
-        let payments = self.sales.list_payments(sale.id).await?;
-        Ok(Self::row_for(sale, &lines, &payments))
+    /// The same documents as [`Self::list_details`], as LIST ROWS for the pages
+    /// that must render a document whose total cannot be computed. A refused
+    /// document keeps its place in the list; the read never fails because of one.
+    pub async fn list_rows(&self) -> AppResult<Vec<SaleListRow>> {
+        self.rows_with_residuals(self.sales.list_sales().await?).await
+    }
+
+    /// Typed list for decision callers that need every residual, including when
+    /// one member's document total refuses. The error remains explicit rather
+    /// than silently dropping a refused debt.
+    pub async fn customer_ageing_rows(
+        &self,
+        customer_id: i64,
+    ) -> AppResult<Vec<SaleListRow>> {
+        self.customer_credit_rows(customer_id).await
     }
 
     /// The same derived list narrowed by the server-side list filter. The
@@ -782,12 +884,7 @@ where
 
     /// The same documents as [`Self::list_details_filtered`], as LIST ROWS.
     pub async fn list_rows_filtered(&self, filter: &SaleListFilter) -> AppResult<Vec<SaleListRow>> {
-        let sales = self.filtered_sales(filter).await?;
-        let mut out = Vec::with_capacity(sales.len());
-        for sale in sales {
-            out.push(self.row_of(sale).await?);
-        }
-        Ok(out)
+        self.rows_with_residuals(self.filtered_sales(filter).await?).await
     }
 
     /// The list filter resolved to documents, so the strict and the tolerant read
@@ -832,10 +929,32 @@ where
     /// give. The DISPLAYING reads use [`Self::customer_credit_rows`], which keeps
     /// the document in the set and states the refusal in place of its figure.
     async fn customer_credit_details(&self, customer_id: i64) -> AppResult<Vec<SaleDetail>> {
-        let rows = self.sales.list_customer_credit_ledger(customer_id).await?;
-        let mut details = Vec::with_capacity(rows.len());
-        for (sale, lines, payments) in rows {
-            details.push(Self::assemble_detail(sale, lines, payments)?);
+        let sales = self.sales.list_confirmed_credit_sales(customer_id).await?;
+        let mut lines_by_sale = Vec::with_capacity(sales.len());
+        let mut ids = Vec::new();
+        for sale in &sales {
+            let lines = self.sales.list_lines(sale.id).await?;
+            if Self::tax_split(&lines).is_ok() {
+                ids.push(sale.id);
+            }
+            lines_by_sale.push((sale.id, lines));
+        }
+        let residuals = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &ids)
+            .await?;
+        let mut details = Vec::with_capacity(sales.len());
+        for sale in sales {
+            let lines = lines_by_sale
+                .iter()
+                .find(|(id, _)| *id == sale.id)
+                .map(|(_, lines)| lines.clone())
+                .ok_or_else(|| AppError::Internal("sale lines missing from detail batch".into()))?;
+            let legacy_payments = self.sales.list_payments(sale.id).await?;
+            let residual = residuals.get(&sale.id).ok_or_else(|| {
+                AppError::Internal(format!("sale {} residual missing from batch", sale.id))
+            })?;
+            details.push(Self::assemble_detail(sale, lines, legacy_payments, residual)?);
         }
         Ok(details)
     }
@@ -850,27 +969,50 @@ where
     /// ledger behind one of them. Both reads run the same checked derivation, so
     /// they cannot disagree about which documents are refusable.
     async fn customer_credit_rows(&self, customer_id: i64) -> AppResult<Vec<SaleListRow>> {
-        let rows = self.sales.list_customer_credit_ledger(customer_id).await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (sale, lines, payments) in rows {
-            out.push(Self::row_for(sale, &lines, &payments));
-        }
-        Ok(out)
+        self.rows_with_residuals(
+            self.sales.list_confirmed_credit_sales(customer_id).await?,
+        )
+        .await
     }
 
-    /// Money owed by one customer: the sum of `due` (`total - paid`) over the
-    /// Confirmed credit sales. A cancelled sale contributes nothing to either
-    /// side, a fully paid sale contributes zero and a cash sale never contributes.
-    /// Drives the credit-limit check and the statement balance.
+    /// Money owed by one customer is the checked sum of document residuals minus
+    /// unapplied `In` deliveries. Residuals are debt still sitting on documents;
+    /// unapplied money has no document to sit on, so a customer credit subtracts
+    /// from the balance. Cancelled sales and cash sales do not contribute. Drives
+    /// the credit-limit check and the statement balance.
     ///
-    /// The sum itself is checked, and it is a DIFFERENT sum from the document
-    /// fold: these are each documents' dues added together, so two documents of
-    /// `4e28` reach a total no single document could. Every document here is
-    /// individually readable, which is exactly why a per-document guard cannot
-    /// cover this and the accumulation has to.
+    /// Both the residual fold and the subtraction are checked: bounded documents
+    /// do not imply a bounded customer total, and raw Decimal subtraction can
+    /// overflow as well.
     pub async fn customer_balance(&self, customer_id: i64) -> AppResult<Decimal> {
-        let details = self.customer_credit_details(customer_id).await?;
-        checked_money_sum(details.iter().map(|detail| &detail.due)).map_err(AppError::PriceRefused)
+        let sales = self
+            .sales
+            .list_confirmed_credit_sales(customer_id)
+            .await?;
+        let ids: Vec<i64> = sales.iter().map(|sale| sale.id).collect();
+        let residuals = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &ids)
+            .await?;
+        let document_amounts: Vec<Decimal> = sales
+            .iter()
+            .map(|sale| {
+                residuals
+                    .get(&sale.id)
+                    .map(|parts| parts.residual)
+                    .ok_or_else(|| {
+                        AppError::Internal("sale residual missing from batch".into())
+                    })
+            })
+            .collect::<AppResult<_>>()?;
+        let documents = checked_money_sum(document_amounts.iter()).map_err(AppError::PriceRefused)?;
+        let unapplied = self
+            .payments
+            .unapplied_for_party(crate::models::PartyType::Customer, customer_id)
+            .await?;
+        documents.checked_sub(unapplied).ok_or_else(|| {
+            AppError::PriceRefused(PriceRefusal::DocumentTotalTooLarge)
+        })
     }
 
     /// The customer's outstanding debt sales, oldest first: `due_date`, then
@@ -983,8 +1125,8 @@ where
         ageing
     }
 
-    /// Ageing of the derived balance against an explicit `as_of`. Only sales with
-    /// `due > 0` are bucketed, so `total()` always equals `customer_balance`.
+    /// Ageing of document residuals against an explicit `as_of`. Only positive
+    /// residuals are bucketed; unapplied credit remains outside document ageing.
     ///
     /// A document that cannot be totaled makes the ageing answer with the rule
     /// rather than with buckets: this is a DISPLAY, and a report that dropped the
@@ -995,24 +1137,46 @@ where
     /// crate is a binary and the pages reach the ageing through the statement.
     #[allow(dead_code)]
     pub async fn customer_ageing(&self, customer_id: i64, as_of: NaiveDate) -> AppResult<Ageing> {
-        let rows = self.customer_credit_rows(customer_id).await?;
+        let rows = self.customer_ageing_rows(customer_id).await?;
         Ok(Self::ageing_of(&rows, as_of))
     }
 
-    /// Chronological ledger of the confirmed credit sales: sales as debits,
-    /// payments as credits, with the running balance after every entry. The final
-    /// balance equals `customer_balance`; `as_of` labels the statement and drives
-    /// the ageing it carries. Cancelled sales contribute nothing to either side.
+    /// Chronological journal report: confirmed credit sales as debits and each
+    /// customer payment delivery as one credit or refund debit, with the running
+    /// balance after every entry. Its final amount equals `customer_balance` when
+    /// all figures are representable; `as_of` labels the statement and drives ageing.
     pub async fn customer_statement(
         &self,
         customer_id: i64,
         as_of: NaiveDate,
     ) -> AppResult<CustomerStatement> {
-        // ONE pass over the ledger, producing both the display row and the
-        // ledger entry for each document, so the statement never reads a document
-        // twice and the two can never disagree.
-        let ledger = self.sales.list_customer_credit_ledger(customer_id).await?;
-        let mut document_rows: Vec<SaleListRow> = Vec::with_capacity(ledger.len());
+        // One batch residual read supplies per-document figures. Delivery credits
+        // come from the party's payment documents, at delivery granularity (not a
+        // fabricated row per allocation).
+        let sales = self.sales.list_confirmed_credit_sales(customer_id).await?;
+        let mut document_lines = Vec::with_capacity(sales.len());
+        let mut ids = Vec::new();
+        for sale in &sales {
+            let lines = self.sales.list_lines(sale.id).await?;
+            if Self::tax_split(&lines).is_ok() {
+                ids.push(sale.id);
+            }
+            document_lines.push((sale.id, lines));
+        }
+        let residuals_result = match self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &ids)
+            .await
+        {
+            Ok(parts) => Ok(parts),
+            Err(AppError::PriceRefused(refusal)) => Err(refusal),
+            Err(error) => return Err(error),
+        };
+        let deliveries = self
+            .payments
+            .list_for_party(crate::models::PartyType::Customer, customer_id)
+            .await?;
+        let mut document_rows: Vec<SaleListRow> = Vec::with_capacity(sales.len());
 
         // Intermediate rows kept only long enough to order the ledger before the
         // running balance is applied. Ties on the same date stay deterministic:
@@ -1033,37 +1197,82 @@ where
         }
 
         let mut rows: Vec<LedgerRow> = Vec::new();
-        for (sale, lines, payments) in &ledger {
-            let row = Self::row_for(sale.clone(), lines, payments);
+        for sale in &sales {
+            let lines = document_lines
+                .iter()
+                .find(|(id, _)| *id == sale.id)
+                .map(|(_, lines)| lines)
+                .ok_or_else(|| {
+                    AppError::Internal("sale lines missing from statement batch".into())
+                })?;
+            let residual = residuals_result
+                .as_ref()
+                .ok()
+                .and_then(|parts| parts.get(&sale.id));
+            let row = match residual {
+                Some(parts) => Self::row_for(sale.clone(), lines, parts),
+                None => SaleListRow {
+                    sale: sale.clone(),
+                    money: None,
+                    total_refusal: Some(
+                        residuals_result
+                            .as_ref()
+                            .err()
+                            .copied()
+                            .unwrap_or(PriceRefusal::DocumentTotalTooLarge),
+                    ),
+                },
+            };
             let document = row.sale.sale_number.clone();
-            let debit = match (row.money, row.total_refusal) {
-                (Some(money), _) => SetMoney::amount(money.total),
-                (None, Some(refusal)) => SetMoney::refused(refusal),
-                (None, None) => SetMoney::amount(Decimal::ZERO),
+            let debit = match (residual, row.total_refusal) {
+                (Some(parts), None) => checked_money_add(parts.charge, parts.signed_returns)
+                    .map(SetMoney::amount)
+                    .unwrap_or_else(SetMoney::refused),
+                (_, Some(refusal)) => SetMoney::refused(refusal),
+                _ => SetMoney::amount(Decimal::ZERO),
             };
             rows.push(LedgerRow {
                 date: row.sale.sale_date,
-                document: document.clone(),
+                document,
                 kind: StatementEntryKind::Sale,
                 source_id: row.sale.id,
                 description: "Credit sale",
                 debit,
                 credit: Decimal::ZERO,
             });
-            for payment in payments {
-                rows.push(LedgerRow {
-                    date: payment.date,
-                    document: document.clone(),
-                    kind: StatementEntryKind::Payment,
-                    source_id: payment.id,
-                    description: "Payment",
-                    debit: SetMoney::amount(Decimal::ZERO),
-                    credit: payment.amount,
-                });
-            }
             document_rows.push(row);
         }
-        let balance = Self::set_sum(&document_rows, |money| money.due);
+        for payment in deliveries {
+            let (debit, credit) = match payment.direction {
+                crate::models::PaymentDirection::In => {
+                    (SetMoney::amount(Decimal::ZERO), payment.amount)
+                }
+                crate::models::PaymentDirection::Out => {
+                    (SetMoney::amount(payment.amount), Decimal::ZERO)
+                }
+            };
+            rows.push(LedgerRow {
+                date: payment.date,
+                document: Some(payment.number),
+                kind: StatementEntryKind::Payment,
+                source_id: payment.id,
+                description: "Payment",
+                debit,
+                credit,
+            });
+        }
+        let document_balance = Self::set_sum(&document_rows, |money| money.due);
+        let unapplied = self
+            .payments
+            .unapplied_for_party(crate::models::PartyType::Customer, customer_id)
+            .await?;
+        let balance = match document_balance.amount {
+            Some(amount) => amount
+                .checked_sub(unapplied)
+                .map(SetMoney::amount)
+                .unwrap_or_else(|| SetMoney::refused(PriceRefusal::DocumentTotalTooLarge)),
+            None => document_balance,
+        };
         let ageing = Self::ageing_of(&document_rows, as_of);
 
         rows.sort_by(|a, b| {
@@ -1136,21 +1345,33 @@ where
         }
     }
 
-    /// Receivables view: every customer with a non-zero derived balance and the
-    /// ageing of that balance as of `as_of`, ordered by customer id.
+    /// Receivables view: every customer with non-zero document residuals and the
+    /// ageing of those residuals as of `as_of`, ordered by customer id.
     ///
     /// Both figures are sums over a SET of documents, so both are [`SetMoney`]s:
     /// a receivables report that dropped the document it could not total would
     /// understate what the shop is owed, and one that refused to render would
     /// take every other customer's row with it.
     pub async fn ageing_all(&self, as_of: NaiveDate) -> AppResult<Vec<CustomerAgeing>> {
-        let mut rows: Vec<SaleListRow> = self.list_rows().await?;
-        // Only confirmed credit sales are receivables, and the filter runs on the
-        // rows so a refused document is judged on its status, never on its money.
-        rows.retain(|row| {
-            row.sale.status == crate::models::SaleStatus::Confirmed
-                && row.sale.payment_type == PaymentType::Credit
-        });
+        let all_sales = self.sales.list_sales().await?;
+        let receivables: Vec<Sale> = all_sales
+            .into_iter()
+            .filter(|sale| {
+                sale.status == crate::models::SaleStatus::Confirmed
+                    && sale.payment_type == PaymentType::Credit
+            })
+            .collect();
+        let rows = self.rows_with_residuals(receivables).await?;
+        let customers_with_rows: std::collections::BTreeSet<i64> =
+            rows.iter().map(|row| row.sale.customer_id).collect();
+        let mut unapplied_by_customer = BTreeMap::new();
+        for customer_id in customers_with_rows {
+            let amount = self
+                .payments
+                .unapplied_for_party(crate::models::PartyType::Customer, customer_id)
+                .await?;
+            unapplied_by_customer.insert(customer_id, amount);
+        }
         let mut by_customer: BTreeMap<i64, Vec<SaleListRow>> = BTreeMap::new();
         for row in rows {
             by_customer
@@ -1161,7 +1382,18 @@ where
         Ok(by_customer
             .into_iter()
             .filter_map(|(customer_id, rows)| {
-                let balance = Self::set_sum(&rows, |money| money.due);
+                let document_balance = Self::set_sum(&rows, |money| money.due);
+                let unapplied = unapplied_by_customer
+                    .get(&customer_id)
+                    .copied()
+                    .unwrap_or(Decimal::ZERO);
+                let balance = match document_balance.amount {
+                    Some(amount) => amount
+                        .checked_sub(unapplied)
+                        .map(SetMoney::amount)
+                        .unwrap_or_else(|| SetMoney::refused(PriceRefusal::DocumentTotalTooLarge)),
+                    None => document_balance,
+                };
                 let ageing = Self::ageing_of(&rows, as_of);
                 let settled = balance
                     .amount
@@ -1188,32 +1420,26 @@ where
     }
 
     /// The debt banner's read: the exact total owed and the number of unpaid
-    /// documents, plus the oldest few. Three batched repository reads, so its query
-    /// count stays constant as the shop's history grows; only the displayed rows
-    /// are read into rows. The totals are decimal sums in Rust, never SQL `SUM`
-    /// over the TEXT columns — and a checked one, because the banner's total is a
-    /// sum over every unpaid document in the shop.
+    /// documents, plus the oldest few. Residuals are read in one batch; totals are
+    /// checked decimal sums in Rust, never SQL `SUM` over TEXT money.
     ///
     /// A document that cannot be totaled keeps its place in `oldest` and makes
     /// `total` a refusal: a banner that quietly omitted it would misstate the
     /// receivable, and a banner that refused to render would empty the panel for
     /// the whole shop.
     pub async fn debt_summary(&self, limit: usize) -> AppResult<DebtSummary> {
-        let ledger = self.sales.list_confirmed_credit_ledger_all().await?;
-        let mut unpaid: Vec<SaleListRow> = Vec::with_capacity(ledger.len());
-        for (sale, lines, payments) in ledger {
-            let row = Self::row_for(sale, &lines, &payments);
-            // A document whose due is unknown is not proven paid, so it stays in
-            // the panel: it is one of the shop's unpaid documents as far as anyone
-            // can show.
-            let unpaid_document = match row.money {
-                Some(money) => money.due > Decimal::ZERO,
-                None => true,
-            };
-            if unpaid_document {
-                unpaid.push(row);
-            }
-        }
+        let mut unpaid = self.list_rows().await?;
+        unpaid.retain(|row| {
+            row.sale.status == crate::models::SaleStatus::Confirmed
+                && row.sale.payment_type == PaymentType::Credit
+        });
+        // A document whose due is unknown is not proven paid, so it stays in
+        // the panel: it is one of the shop's unpaid documents as far as anyone
+        // can show.
+        unpaid.retain(|row| match row.money {
+            Some(money) => money.due > Decimal::ZERO,
+            None => true,
+        });
         let total = Self::set_sum(&unpaid, |money| money.due);
         let count = unpaid.len();
         unpaid.truncate(limit);
@@ -1279,7 +1505,13 @@ where
         // movements, the finance rows, the sequence number. A confirmation that
         // cannot state what the document costs must refuse with nothing written,
         // exactly as it refuses an inactive product here.
-        let (total, _, _) = Self::totals(&lines, &self.sales.list_payments(sale_id).await?)
+        let empty_residual = DocumentResidualParts {
+            charge: Decimal::ZERO,
+            signed_returns: Decimal::ZERO,
+            allocated: Decimal::ZERO,
+            residual: Decimal::ZERO,
+        };
+        let (total, _, _) = Self::totals(&lines, &empty_residual)
             .map_err(AppError::PriceRefused)?;
 
         // The cash account is derived from the method, which belongs to exactly
@@ -1295,7 +1527,11 @@ where
                     ));
                 }
                 // Ownership resolved before any stock/sequence/finance touch.
-                Some(self.resolve_method_account(method_id).await?)
+                // `confirm` is handed a METHOD and nothing else — the pair on the
+                // payment row is derived from it — so there is no stated account
+                // to disagree with here. The door that DOES take a stated account
+                // is `record_payment`, and it checks the pair before writing.
+                Some(self.resolve_method_account(method_id, None).await?)
             }
             PaymentType::Credit => {
                 if cash_method_id.is_some() {
@@ -1447,22 +1683,80 @@ where
         // Finance: Cash => 1 payment + Income now; Credit => receivable, no Income.
         // The Income is stamped with reference = sale_number and linked back from
         // the payment row it produced.
-        if sale.payment_type == PaymentType::Cash && total > Decimal::ZERO {
-            let account_id = cash_account_id.unwrap();
-            let method_id = cash_method_id.unwrap();
-            let income = self
-                .transactions
-                .create_with_reference_in(
+        // `cash_account_id`/`cash_method_id` are `Some` exactly when this is a Cash
+        // sale with money to move; the pair is unwrapped here and used far below,
+        // AFTER the charge, because the journal must read: the shop sold, and then
+        // the customer paid.
+        let cash_leg = if sale.payment_type == PaymentType::Cash && total > Decimal::ZERO {
+            Some((cash_account_id.unwrap(), cash_method_id.unwrap()))
+        } else {
+            None
+        };
+
+        // The customer's journal, in the SAME unit as the document (T2 of
+        // odd/tasks/party-ledger.md). A sale is a CHARGE whichever way it is
+        // paid: the shop delivered goods worth `total`, so the customer owes
+        // `total` from this moment. A cash sale appends the Payment right after
+        // (below), and the two rows fold to zero — which is why the cash case
+        // needs no branch here and the balance stays the single fold of the
+        // journal rather than a special case per payment type.
+        //
+        // `Charge` and not a signed `±total` computed here: the sign rule lives
+        // in `PartyEntryKind::signed_amount`, one place, so no write path holds
+        // a second opinion about it.
+        if total > Decimal::ZERO {
+            self.party_ledger
+                .insert_in(
                     &mut tx,
-                    actor,
-                    account_id,
-                    crate::models::TransactionKind::Income,
-                    total,
-                    Some(sale_number.clone()),
-                    Some(sale_number.clone()),
-                    sale.sale_date,
+                    &crate::models::NewPartyLedgerEntry {
+                        party_type: crate::models::PartyType::Customer,
+                        party_id: sale.customer_id,
+                        kind: crate::models::PartyEntryKind::Charge,
+                        amount: crate::models::PartyEntryKind::Charge.signed_amount(total),
+                        document_kind: crate::models::PartyDocumentKind::Sale,
+                        document_id: sale_id,
+                        entry_date: sale.sale_date,
+                        reference: Some(sale_number.clone()),
+                        created_by: actor,
+                    },
                 )
                 .await?;
+        }
+
+        // The cash tender's own `Payment` entry is NOT written here: it belongs to
+        // the DELIVERY, and `record_delivery_in` (called just below, after this
+        // charge) is the one writer that produces it. Writing it here as well put two
+        // `Payment` rows in the journal for one tender — caught by
+        // `a_confirmed_cash_sale_appends_a_charge_and_its_settlement`.
+        // The cash tender, and it comes AFTER the charge so an intermediate reader
+        // sees a debt and then its settlement, never the reverse. It is a DELIVERY
+        // like any other (decision 5) and goes through the ONE writer, which is what
+        // keeps `confirm`, `record_payment` and a multi-invoice collection from
+        // drifting into three opinions about what a delivery looks like.
+        if let Some((account_id, method_id)) = cash_leg {
+            let cash_delivery = crate::services::payment_writer::record_delivery_in(
+                &self.sequences,
+                &self.transactions,
+                &self.party_ledger,
+                &self.payments,
+                &mut tx,
+                actor,
+                crate::models::PaymentDirection::In,
+                crate::models::PartyType::Customer,
+                sale.customer_id,
+                (crate::models::PartyDocumentKind::Sale, sale_id),
+                method_id,
+                account_id,
+                total,
+                sale.sale_date,
+                None,
+                Some(sale_number.clone()),
+                None,
+                &[(crate::models::PartyDocumentKind::Sale, sale_id, total)],
+            )
+            .await?;
+
+            // The legacy row, until P5 moves the reads, in the same unit.
             self.sales
                 .create_payment_in(
                     &mut tx,
@@ -1472,7 +1766,7 @@ where
                     method_id,
                     total,
                     sale.sale_date,
-                    Some(income.id),
+                    cash_delivery.transaction_id,
                     None,
                 )
                 .await?;
@@ -1496,6 +1790,43 @@ where
         self.detail_for(confirmed).await
     }
 
+    /// Link one covered sale to the delivery's SINGLE movement, in the caller's unit.
+    ///
+    /// This is the legacy `sale_payments` row, kept until P5 moves the reads: the
+    /// receipt's own read asks for it, and with decision 8 it stops being the HOME of
+    /// the attribution (that is `payment_allocations`) and becomes a pointer that
+    /// lets the old read keep answering.
+    ///
+    /// Every row written this way names the SAME `transaction_id`, which is why the
+    /// traceability invariant had to be re-based: a transaction belongs to one
+    /// DELIVERY, and N documents may share it inside that delivery.
+    pub async fn link_delivery_payment_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        receipt_id: i64,
+        sale_id: i64,
+        account_id: i64,
+        method_id: i64,
+        amount: Decimal,
+        date: NaiveDate,
+        transaction_id: Option<i64>,
+    ) -> AppResult<SalePayment> {
+        self.sales
+            .create_payment_in(
+                tx,
+                actor,
+                sale_id,
+                account_id,
+                method_id,
+                amount,
+                date,
+                transaction_id,
+                Some(receipt_id),
+            )
+            .await
+    }
+
     // -- Pay (Credit) ------------------------------------------------------------
 
     /// Record a payment on one sale, without a receipt: this is a direct payment
@@ -1512,10 +1843,27 @@ where
             .await
     }
 
-    /// Record a payment on one sale. `receipt_id` groups the payment under the
-    /// customer receipt a collection produced; `None` is a direct payment on a
-    /// single sale. Either way the payment posts its own Income and keeps its
-    /// `transaction_id`; the receipt never posts a movement of its own.
+    /// Record a payment on one sale, ALL of it inside one unit (P3 of
+    /// `odd/tasks/payment-allocation.md`).
+    ///
+    /// **What this fixes.** Before P3 this method posted the `Income` in one unit
+    /// and the payment row in a second (the defect the payment-allocation plan
+    /// records as flow 5: "a failure between the two leaves cash in the box with no
+    /// document behind it"). A live defect, not a hypothetical one. Every write is
+    /// an `_in` form now and the unit opens immediately after the pre-checks, so a
+    /// failure anywhere leaves neither the money nor the row.
+    ///
+    /// **What it writes.** The delivery of money is a `payments` document with its
+    /// own number (decision 1), the ONE cash movement it produced (decision 5), one
+    /// allocation naming the sale it covers, and one `Payment` ledger entry
+    /// (decision 6: one entry per payment DOCUMENT, not per invoice). The legacy
+    /// `sale_payments` row is still written, because the reads have not moved yet
+    /// (that is P5) and dropping it now would break every list that shows a sale's
+    /// payments. Two homes for one fact is a P3 cost, named here so P5/P8 settle it.
+    ///
+    /// The account is DERIVED from the method, never stated, so the (account,
+    /// method) pair cannot disagree with itself — migration 44's guard, and from
+    /// migration 46 the same guard on `payments`.
     pub async fn record_payment_with_receipt(
         &self,
         actor: i64,
@@ -1539,9 +1887,14 @@ where
             return Err(AppError::Validation("amount must be > 0".into()));
         }
         // The account is derived from the method's owner (no finance touch yet).
-        let account_id = self.resolve_method_account(method_id).await?;
+        let account_id = self.resolve_method_account(method_id, None).await?;
         let lines = self.sales.list_lines(sale_id).await?;
-        let payments = self.sales.list_payments(sale_id).await?;
+        let residual = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &[sale_id])
+            .await?
+            .remove(&sale_id)
+            .ok_or_else(|| AppError::Internal("sale residual missing from batch".into()))?;
         // The ceiling is measured against the DUE BALANCE, not against
         // `paid + amount`. Both say the same thing while `paid <= total`, and
         // only one of them can be computed at all: `amount` is an operator's
@@ -1549,7 +1902,8 @@ where
         // typing a payment of `4e28` against an ordinary sale would overflow
         // here rather than be refused the overpayment they just typed. The
         // message is unchanged, and the figures in it are stated, never summed.
-        let (total, paid, due) = Self::totals(&lines, &payments).map_err(AppError::PriceRefused)?;
+        let (total, paid, due) = Self::totals(&lines, &residual).map_err(AppError::PriceRefused)?;
+        let _ = paid;
         if amount > due {
             return Err(AppError::Validation(format!(
                 "overpay rejected: paid {paid} + {amount} exceeds total {total}"
@@ -1559,37 +1913,70 @@ where
             .sale_number
             .clone()
             .ok_or_else(|| AppError::Internal("confirmed sale missing sale_number".into()))?;
-        // Each payment generates one M0 Income stamped with reference =
-        // sale_number and linked from the payment row it produced.
-        let income = self
-            .transactions
-            .create_with_reference(
-                actor,
-                account_id,
-                crate::models::TransactionKind::Income,
-                amount,
-                Some(sale_number.clone()),
-                Some(sale_number),
-                date,
-            )
-            .await?;
-        self.sales
-            .create_payment(
+        let _ = sale_number;
+
+        // ---- THE WRITE UNIT -------------------------------------------------
+        //
+        // Every read above is a pre-check: it buys an EARLY refusal with a useful
+        // message rather than reachability. The unit opens here, after all of them,
+        // and everything from the number to the legacy row commits or rolls back
+        // together.
+        let mut tx = self.sales.pool().begin().await?;
+
+        // 1-5. The delivery itself: its number, its ONE movement, the share naming
+        // this sale, and the ledger entry — through the ONE writer, so this path and
+        // a multi-sale collection and a cash confirm cannot drift apart.
+        let delivery = crate::services::payment_writer::record_delivery_in(
+            &self.sequences,
+            &self.transactions,
+            &self.party_ledger,
+            &self.payments,
+            &mut tx,
+            actor,
+            crate::models::PaymentDirection::In,
+            crate::models::PartyType::Customer,
+            sale.customer_id,
+            (crate::models::PartyDocumentKind::Sale, sale_id),
+            method_id,
+            account_id,
+            amount,
+            date,
+            None,
+            Some(sale_number.clone()),
+            // A direct payment on one sale is not grouped under a receipt.
+            None,
+            // The SHARE is what the sale still owes — never the amount typed. The
+            // difference between the two is the customer's credit, and it stays on
+            // the payment rather than inside the document.
+            &[(
+                crate::models::PartyDocumentKind::Sale,
+                sale_id,
+                amount.min(due),
+            )],
+        )
+        .await?;
+
+        // 6. The legacy row, until P5 moves the reads. Still `_in`, still the same
+        // unit, so the two homes of the same fact cannot disagree.
+        let legacy = self
+            .sales
+            .create_payment_in(
+                &mut tx,
                 actor,
                 sale_id,
                 account_id,
                 method_id,
                 amount,
                 date,
-                Some(income.id),
+                delivery.transaction_id,
                 receipt_id,
             )
             .await
             .map_err(|e| match e {
                 // The database trigger refuses a payment grouped under another
                 // customer's receipt. Surfacing it as a Validation keeps the
-                // interface's contract a clean 400 even if a future caller passes a
-                // receipt id directly; no route offers that path.
+                // interface's contract a clean 400 even if a future caller passes
+                // a receipt id directly; no route offers that path.
                 AppError::Database(ref db)
                     if db.to_string().contains("another customer's receipt") =>
                 {
@@ -1599,7 +1986,10 @@ where
                     )
                 }
                 other => other,
-            })
+            })?;
+
+        tx.commit().await?;
+        Ok(legacy)
     }
 
     // -- Cancel / Return -----------------------------------------------------------
@@ -1628,8 +2018,14 @@ where
         // removed from it, and `delete_draft` removes a never-confirmed document
         // outright without ever reading its money.
         let lines = self.sales.list_lines(sale_id).await?;
+        let residual = self
+            .payments
+            .residuals_for_documents(crate::models::PartyDocumentKind::Sale, &[sale_id])
+            .await?
+            .remove(&sale_id)
+            .ok_or_else(|| AppError::Internal("sale residual missing from batch".into()))?;
         let payments = self.sales.list_payments(sale_id).await?;
-        Self::totals(&lines, &payments).map_err(AppError::PriceRefused)?;
+        Self::totals(&lines, &residual).map_err(AppError::PriceRefused)?;
 
         if sale.status == crate::models::SaleStatus::Draft {
             // Draft -> Cancelled: no-op, no stock/finance.
@@ -1723,11 +2119,28 @@ where
             }
         }
 
-        // Stock In (reason Sale-return) for tracked lines. The movement
-        // carries the cancelling request's actor, like its refund Expense.
+        // ---- THE WRITE UNIT -------------------------------------------------
+        //
+        // Everything from here to the COMMIT is ONE transaction: the stock coming
+        // back, one refund DELIVERY per paid amount, the legacy links and the
+        // cancellation itself.
+        //
+        // **This is what T3d fixed, and the direction of the leak is the reason it
+        // matters more than it looks.** Before, the stock came back and each refund
+        // was posted by `create_with_reference` — a unit of ITS OWN — and only then was
+        // the sale flipped to Cancelled. A failure in between left the money actually
+        // refunded and the document still showing Confirmed: the operator sees a live
+        // debt that has already been paid out. The pre-checks above (the aggregate
+        // refund guard, the product checks) are still where they were, on purpose:
+        // they buy an early refusal with a useful message rather than reachability.
+        let mut tx = self.sales.pool().begin().await?;
+
+        // 1. Stock In (reason Sale-return) for tracked lines. The movement carries the
+        // cancelling request's actor, like its refund Expense.
         for line in &tracked {
             self.inventory
-                .record_movement(
+                .record_movement_in(
+                    &mut tx,
                     actor,
                     NewMovement {
                         product_id: line.product_id,
@@ -1741,30 +2154,58 @@ where
                 .await?;
         }
 
-        // Refund Expense per paid amount to originating accounts, each linked
-        // back from the payment row it refunds.
+        // 2. One refund DELIVERY per paid amount, to the account the money came in
+        // through (decision 9). A refund is a payment with `direction='Out'` that
+        // REPLAYS the parent payment's account — which is why it must read the
+        // historical account off the payment row and never re-derive it from the
+        // method, whose owner may have moved since.
+        //
+        // One delivery per parent payment rather than one for the whole annulment,
+        // because the refunds can land in DIFFERENT accounts: two payments into two
+        // boxes have to come back out of their own boxes, and a single delivery has one
+        // account.
         for pay in &payments {
-            let refund = self
-                .transactions
-                .create_with_reference(
-                    actor,
-                    pay.account_id,
-                    crate::models::TransactionKind::Expense,
-                    pay.amount,
-                    Some(sale_number.clone()),
-                    Some(sale_number.clone()),
-                    sale.sale_date,
-                )
-                .await?;
+            let refund_delivery = crate::services::payment_writer::record_delivery_in(
+                &self.sequences,
+                &self.transactions,
+                &self.party_ledger,
+                &self.payments,
+                &mut tx,
+                actor,
+                crate::models::PaymentDirection::Out,
+                crate::models::PartyType::Customer,
+                sale.customer_id,
+                (crate::models::PartyDocumentKind::Sale, sale_id),
+                pay.method_id,
+                pay.account_id,
+                pay.amount,
+                sale.sale_date,
+                Some(format!("cancellation of {sale_number}")),
+                Some(sale_number.clone()),
+                None,
+                // The refund does not APPLY money to a document; it takes money
+                // back out. An allocation is what covers a debt, so there is none:
+                // the sale itself is being annulled, not paid.
+                &[],
+            )
+            .await?;
+            let refund_id = refund_delivery
+                .transaction_id
+                .ok_or_else(|| AppError::Internal("refund delivery has no movement".into()))?;
             self.sales
-                .set_payment_refund_transaction(actor, pay.id, refund.id)
+                .set_payment_refund_transaction_in(&mut tx, actor, pay.id, refund_id)
                 .await?;
         }
 
+        // 3. The document stops being Confirmed. In the same unit as the money leaving.
         let cancelled = self
             .sales
-            .set_cancelled(sale_id, actor, reason.as_deref())
+            .set_cancelled_in(&mut tx, sale_id, actor, reason.as_deref())
             .await?;
+
+        tx.commit().await?;
+
+        // AFTER THE COMMIT, DELIBERATELY: `detail_for` reads through the pool.
         self.detail_for(cancelled).await
     }
 
@@ -1822,6 +2263,10 @@ mod tests {
         SqliteSaleRepository, SqliteStockMovementRepository, SqliteTaxSnapshotRepository,
         SqliteTransactionRepository, TaxRepository,
     };
+    use crate::repositories::{
+        PartyLedgerRepository, PaymentRepository, SqlitePartyLedgerRepository,
+        SqlitePaymentRepository,
+    };
     use crate::security::test_support;
     use crate::services::{CustomerService, InventoryService, TransactionService};
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
@@ -1855,6 +2300,8 @@ mod tests {
         SqlitePaymentMethodRepository,
         SqliteCustomerRepository,
         SqliteTaxSnapshotRepository,
+        SqlitePartyLedgerRepository,
+        SqlitePaymentRepository,
     >;
 
     async fn test_pool() -> sqlx::SqlitePool {
@@ -1924,6 +2371,8 @@ mod tests {
             customers,
             SqliteTaxSnapshotRepository::new(pool.clone()),
             enforce_credit_limit,
+            SqlitePartyLedgerRepository::new(pool.clone()),
+            SqlitePaymentRepository::new(pool.clone()),
         );
         (s, pool)
     }
@@ -2031,9 +2480,35 @@ mod tests {
             .id
     }
 
+    /// A method this account owns, created the way the product creates one.
+    ///
+    /// Migration 45 deleted the history-less seed leftovers, so a test that wants
+    /// a second method of its own has to create it instead of looking up a name
+    /// that is no longer in the table.
+    async fn own_method(s: &Svc, account_id: i64, name: &str) -> i64 {
+        s.payment_methods
+            .create_in_account(audit_actor(s).await, name, account_id)
+            .await
+            .unwrap()
+            .id
+    }
+
+    /// A method that exists but CANNOT be used: owned by the account and
+    /// deactivated. Migration 45 made "unowned" unrepresentable, so this is what
+    /// "this method cannot pay" means now — and it is the refusal the operator
+    /// sees when they untick a method in the account editor.
+    async fn inactive_method(s: &Svc, account_id: i64, name: &str) -> i64 {
+        let id = own_method(s, account_id, name).await;
+        s.payment_methods
+            .set_active(audit_actor(s).await, id, false)
+            .await
+            .unwrap();
+        id
+    }
+
     async fn allow(s: &Svc, account_id: i64, method_id: i64) {
         s.payment_methods
-            .set_method_account(audit_actor(s).await, method_id, Some(account_id))
+            .set_method_account(audit_actor(s).await, method_id, account_id)
             .await
             .unwrap()
     }
@@ -3236,15 +3711,29 @@ mod tests {
         );
     }
 
+    /// Migration 12 seeded five methods and none of them was owned; migration 45
+    /// adopts the head of that order (`Cash`) into the account it also seeds and
+    /// deletes the four that had no history to protect. `Other` is still not a
+    /// seeded name — the assertion this test has always carried.
     #[tokio::test]
     async fn red_payment_methods_seeded_without_other() {
         let (_s, pool) = svc().await;
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT name FROM payment_methods ORDER BY name")
-            .fetch_all(&pool)
-            .await
-            .unwrap();
-        let names: Vec<String> = rows.into_iter().map(|r| r.0).collect();
-        assert_eq!(names, vec!["Cash", "CreditCard", "Debit", "QR", "Transfer"]);
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT name, account_id FROM payment_methods ORDER BY name")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        let names: Vec<String> = rows.iter().map(|r| r.0.clone()).collect();
+        assert_eq!(
+            names,
+            vec!["Cash"],
+            "only the method the seed owns survives; the history-less leftovers are deleted"
+        );
+        assert!(!names.iter().any(|n| n == "Other"));
+        assert!(
+            rows.iter().all(|r| r.1 > 0),
+            "and every surviving method has an owner, which is what NOT NULL bought"
+        );
     }
 
     #[tokio::test]
@@ -3308,13 +3797,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn methods_unassigned_method_rejected_without_side_effects() {
+    async fn methods_inactive_method_rejected_without_side_effects() {
         let (s, pool) = svc().await;
         let prod = seed_product(&s, "M-DENY", "10").await;
         seed_stock(&s, prod.id, "10").await;
-        let _acc = seed_account(&s, "m-deny").await;
-        // Cash belongs to no account: it cannot confirm.
-        let cash = cash_method(&s).await;
+        let acc = seed_account(&s, "m-deny").await;
+        // Owned by the account but DEACTIVATED, which is the only "this method
+        // cannot pay" state migration 45 left.
+        let cash = inactive_method(&s, acc.id, "Cash").await;
         let sale = s
             .create_draft(
                 audit_actor(&s).await,
@@ -3354,10 +3844,10 @@ mod tests {
         seed_stock(&s, prod.id, "10").await;
         let acc_a = seed_account(&s, "m-mix-a").await;
         let acc_b = seed_account(&s, "m-mix-b").await;
-        let cash = cash_method(&s).await;
-        let transfer = method_by_name(&s, "Transfer").await;
-        allow(&s, acc_a.id, cash).await;
-        allow(&s, acc_b.id, transfer).await;
+        // Each account gets its OWN method: migration 45 has one owner per row,
+        // so "Cash on A and Transfer on B" means two rows created here.
+        let cash = own_method(&s, acc_a.id, "Cash").await;
+        let transfer = own_method(&s, acc_b.id, "Transfer").await;
         let sale = s
             .create_draft(
                 audit_actor(&s).await,
@@ -3405,15 +3895,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn methods_record_payment_rejects_unassigned_without_finance_touch() {
+    async fn methods_record_payment_rejects_an_inactive_method_without_finance_touch() {
         let (s, pool) = svc().await;
         let prod = seed_product(&s, "M-PAY-DENY", "10").await;
         seed_stock(&s, prod.id, "10").await;
         let acc = seed_account(&s, "m-pay-deny").await;
-        let cash = cash_method(&s).await;
-        let qr = method_by_name(&s, "QR").await;
-        allow(&s, acc.id, cash).await;
-        // QR belongs to no account, so it cannot pay.
+        let _cash = own_method(&s, acc.id, "Cash").await;
+        // Deactivated: the reachable "this method cannot pay" state after
+        // migration 45 removed "belongs to no account".
+        let qr = inactive_method(&s, acc.id, "QR").await;
         let sale = s
             .create_draft(
                 audit_actor(&s).await,
@@ -3443,6 +3933,533 @@ mod tests {
         assert_eq!(tx_count(&pool).await, tx_before);
         let d = s.get_detail(sale.id).await.unwrap();
         assert_eq!(d.paid, Decimal::ZERO);
+    }
+
+    /// **THE test for T3d: the leak went the dangerous way.**
+    ///
+    /// Before T3d a cancellation returned the stock and posted each refund with
+    /// `create_with_reference` — a unit of its OWN — and only then flipped the sale to
+    /// Cancelled. A failure in between left the money actually refunded and the
+    /// document still Confirmed: the operator sees a live debt that has already been
+    /// paid out, and nothing reconciles the two.
+    ///
+    /// The failure is injected on the CANCELLATION UPDATE, which is the last write of
+    /// the unit, so every refund is already on the connection when it fires.
+    #[tokio::test]
+    async fn a_failure_while_cancelling_rolls_the_refunds_and_the_stock_back() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "T3D-ATOMIC", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "t3d-atomic").await;
+        let cash = own_method(&s, acc.id, "Cash").await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: CREDIT_CUSTOMER_ID,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap(); // total 20
+        s.confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap();
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("20"), sale_date())
+            .await
+            .unwrap();
+
+        let stock_before = s.inventory.stock_for_decision(prod.id).await.unwrap();
+        let tx_before = tx_count(&pool).await;
+
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_cancel_failure BEFORE UPDATE ON sales \
+             WHEN NEW.status = 'Cancelled' \
+             BEGIN SELECT RAISE(ABORT, 'injected failure after the refunds'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .cancel(audit_actor(&s).await, sale.id, Some("injected".into()))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+
+        // NOTHING survived: the refund did not leave, the goods did not come back, no
+        // delivery was born and the sale is still Confirmed.
+        assert_eq!(
+            tx_count(&pool).await,
+            tx_before,
+            "the refund movement must die with the unit"
+        );
+        assert_eq!(
+            s.inventory.stock_for_decision(prod.id).await.unwrap(),
+            stock_before,
+            "and the goods must not have come back either"
+        );
+        let out_deliveries: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM payments WHERE direction = 'Out'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(out_deliveries, 0, "no refund document exists");
+        let refunds: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sale_payments WHERE refund_transaction_id IS NOT NULL",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(refunds, 0, "and no legacy row claims one");
+        assert_eq!(
+            s.sales.find_sale(sale.id).await.unwrap().unwrap().status,
+            crate::models::SaleStatus::Confirmed,
+            "the sale is still live: the refusal was a refusal, not a half annulment"
+        );
+    }
+
+    /// A successful cancellation writes the refund as an `Out` delivery that REPLAYS
+    /// the parent payment's account, and the ledger records the reversal.
+    #[tokio::test]
+    async fn a_cancellation_writes_an_out_delivery_replaying_the_parents_account() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "T3D-SHAPE", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "t3d-shape").await;
+        let cash = own_method(&s, acc.id, "Cash").await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: CREDIT_CUSTOMER_ID,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap();
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("20"), sale_date())
+            .await
+            .unwrap();
+
+        s.cancel(audit_actor(&s).await, sale.id, Some("shape".into()))
+            .await
+            .unwrap();
+
+        // The Out delivery: same account, same amount as what came in.
+        let out: (String, String, i64, i64) = sqlx::query_as(
+            "SELECT direction, amount, party_id, account_id FROM payments \
+              WHERE direction = 'Out' ORDER BY id",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(out.0, "Out");
+        assert_eq!(out.1, "20");
+        assert_eq!(out.2, CREDIT_CUSTOMER_ID);
+        assert_eq!(
+            out.3, acc.id,
+            "the money goes back out of the box it came into"
+        );
+
+        // Its movement is the sale's reversal and carries the delivery number.
+        let movement: (String, String) = sqlx::query_as(
+            "SELECT t.kind, t.amount FROM transactions t JOIN payments p ON p.transaction_id = t.id \
+              WHERE p.direction = 'Out'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(movement, ("Expense".to_string(), "20".to_string()));
+
+        // And the ledger: the charge, the payment, and the refund that cancels both.
+        let entries: Vec<(String, String)> =
+            sqlx::query_as("SELECT kind, amount FROM party_ledger_entries ORDER BY id")
+                .fetch_all(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            entries,
+            vec![
+                ("Charge".to_string(), "20".to_string()),
+                ("Payment".to_string(), "-20".to_string()),
+                ("Refund".to_string(), "20".to_string()),
+            ],
+            "a cancellation reverses: charge, payment, refund"
+        );
+    }
+
+    // -- P3: the delivery of money is one unit -----------------------------------
+
+    /// **THE test for P3a: the live atomicity defect.**
+    ///
+    /// Before P3, `record_payment` posted the `Income` in one unit and the payment
+    /// row in a second, so a failure between them left cash in the box with no
+    /// document behind it — flow 5 of the payment-allocation plan, a live defect
+    /// rather than a hypothetical one. The failure is injected AFTER the movement
+    /// and before the document, which is exactly the window that used to leak.
+    #[tokio::test]
+    async fn a_failure_after_the_movement_rolls_the_whole_delivery_back() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "P3-ATOMIC", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "p3-atomic").await;
+        let cash = own_method(&s, acc.id, "Cash").await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: CREDIT_CUSTOMER_ID,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("3"), None)
+            .await
+            .unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap();
+        let tx_before = tx_count(&pool).await;
+
+        // The window: the money is already written, the document is not.
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_payment_document_failure BEFORE INSERT ON payments \
+             BEGIN SELECT RAISE(ABORT, 'injected failure between the cash row and the payment'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .record_payment(audit_actor(&s).await, sale.id, cash, dec("10"), sale_date())
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+
+        // NOTHING survived: not the movement, not the legacy row, not the document,
+        // not the ledger entry, and the sale still shows no payment.
+        assert_eq!(
+            tx_count(&pool).await,
+            tx_before,
+            "the Income must die with the unit that wrote it"
+        );
+        let payments: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(payments, 0);
+        let legacy: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM sale_payments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(legacy, 0, "the legacy row is in the same unit");
+        let entries: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM party_ledger_entries WHERE kind = 'Payment'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(entries, 0);
+        assert_eq!(
+            s.get_detail(sale.id).await.unwrap().paid,
+            Decimal::ZERO,
+            "and the sale shows nothing paid"
+        );
+        // The number was not burned either: the sequence row only commits with the
+        // unit, so a retry takes the FIRST number.
+        let last: Option<i64> =
+            sqlx::query_scalar("SELECT last_number FROM doc_sequences WHERE doc_type = 'PAYMENT'")
+                .fetch_optional(&pool)
+                .await
+                .unwrap();
+        assert_eq!(last, None, "a rolled-back delivery returns its number");
+    }
+
+    /// A successful direct payment writes the document, its share, its ledger entry
+    /// and the legacy row — all four, and the money moves exactly once.
+    #[tokio::test]
+    async fn a_direct_payment_writes_the_document_its_share_and_one_movement() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "P3-SHAPE", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "p3-shape").await;
+        let cash = own_method(&s, acc.id, "Cash").await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: CREDIT_CUSTOMER_ID,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("3"), None)
+            .await
+            .unwrap(); // total 30
+        s.confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap();
+        let tx_before = tx_count(&pool).await;
+
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("20"), sale_date())
+            .await
+            .unwrap();
+
+        // ONE movement for the delivery, not one per document it covers.
+        assert_eq!(tx_count(&pool).await, tx_before + 1);
+
+        let payment = s
+            .payments
+            .list_for_party(crate::models::PartyType::Customer, CREDIT_CUSTOMER_ID)
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the delivery is a document");
+        assert_eq!(payment.amount, dec("20"));
+        assert_eq!(payment.direction, crate::models::PaymentDirection::In);
+        assert!(
+            payment.transaction_id.is_some(),
+            "and it names its movement"
+        );
+
+        // Its share names the sale, and it is exactly what the payment delivered.
+        let shares = s.payments.list_allocations(payment.id).await.unwrap();
+        assert_eq!(shares.len(), 1);
+        assert_eq!(
+            shares[0].target_kind,
+            crate::models::PartyDocumentKind::Sale
+        );
+        assert_eq!(shares[0].target_id, sale.id);
+        assert_eq!(shares[0].amount, dec("20"));
+        assert_eq!(
+            s.payments.unapplied_for_payment(payment.id).await.unwrap(),
+            Decimal::ZERO,
+            "the whole delivery was applied"
+        );
+
+        // And the sale's residual is what the document says.
+        let detail = s.get_detail(sale.id).await.unwrap();
+        assert_eq!(detail.paid, dec("20"));
+        assert_eq!(detail.due, dec("10"));
+    }
+
+    // -- the party ledger (T2) ---------------------------------------------------
+
+    /// The journal rows of one document, oldest first, as the sign rule stored
+    /// them. Read through SQL rather than through a service read on purpose: what
+    /// this pins is what `confirm` WROTE, and a read path of its own could agree
+    /// with the write while both disagree with the schema.
+    async fn ledger_rows(pool: &sqlx::SqlitePool, document_id: i64) -> Vec<(String, String)> {
+        sqlx::query_as(
+            "SELECT kind, amount FROM party_ledger_entries \
+             WHERE document_kind = 'Sale' AND document_id = ? ORDER BY id",
+        )
+        .bind(document_id)
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// A confirmed CREDIT sale is a debt: one `Charge` of `+total`, no cash leg,
+    /// and the customer's balance is exactly that figure.
+    #[tokio::test]
+    async fn a_confirmed_credit_sale_appends_one_charge_for_its_total() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "LEDGER-CREDIT", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let customer = seed_customer(&s, "Ledger Credit Buyer", None, None).await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap(); // total 20
+
+        s.confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ledger_rows(&pool, sale.id).await,
+            vec![("Charge".to_string(), "20".to_string())],
+            "a credit sale owes its total: one Charge, and no cash leg"
+        );
+        assert_eq!(
+            s.party_ledger
+                .balance_for_party(crate::models::PartyType::Customer, customer.id)
+                .await
+                .unwrap(),
+            dec("20"),
+            "and the balance is the fold of that row"
+        );
+    }
+
+    /// A confirmed CASH sale is a debt settled on the spot: `+total` and
+    /// `−total` in the SAME unit, folding to zero. The two rows are the point —
+    /// a single signed row would hide that money moved, and the balance would
+    /// stop being the fold of the journal.
+    #[tokio::test]
+    async fn a_confirmed_cash_sale_appends_a_charge_and_its_settlement() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "LEDGER-CASH", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let acc = seed_account(&s, "ledger-cash").await;
+        let cash = cash_method(&s).await;
+        allow(&s, acc.id, cash).await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: WALKIN_ID,
+                    payment_type: PaymentType::Cash,
+                    sale_date: sale_date(),
+                    due_date: None,
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("3"), None)
+            .await
+            .unwrap(); // total 30
+
+        s.confirm(audit_actor(&s).await, sale.id, Some(cash))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ledger_rows(&pool, sale.id).await,
+            vec![
+                ("Charge".to_string(), "30".to_string()),
+                ("Payment".to_string(), "-30".to_string()),
+            ],
+            "a cash sale charges and settles in one confirm, in that order"
+        );
+        assert_eq!(
+            s.party_ledger
+                .balance_for_party(crate::models::PartyType::Customer, WALKIN_ID)
+                .await
+                .unwrap(),
+            Decimal::ZERO,
+            "and the two rows fold to nothing owed"
+        );
+    }
+
+    /// The write joins the caller's unit, which is the whole reason it is an
+    /// `_in` call: a failure AFTER the entry rolls the entry back with the
+    /// document. The injected failure is sqlite refusing the confirmation write
+    /// — the last write in the unit — so the ledger row is already in the table
+    /// when the unit dies.
+    #[tokio::test]
+    async fn a_failed_confirm_rolls_the_ledger_entry_back_with_the_document() {
+        let (s, pool) = svc().await;
+        let prod = seed_product(&s, "LEDGER-ROLLBACK", "10").await;
+        seed_stock(&s, prod.id, "10").await;
+        let customer = seed_customer(&s, "Ledger Rollback Buyer", None, None).await;
+        let sale = s
+            .create_draft(
+                audit_actor(&s).await,
+                NewSale {
+                    customer_id: customer.id,
+                    payment_type: PaymentType::Credit,
+                    sale_date: sale_date(),
+                    due_date: Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+                    receipt_no: None,
+                    notes: None,
+                },
+            )
+            .await
+            .unwrap();
+        s.add_line(audit_actor(&s).await, sale.id, prod.id, dec("2"), None)
+            .await
+            .unwrap();
+
+        sqlx::raw_sql(
+            "CREATE TRIGGER injected_ledger_probe BEFORE UPDATE ON sales \
+             WHEN NEW.status = 'Confirmed' \
+             BEGIN SELECT RAISE(ABORT, 'injected failure after the ledger write'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let err = s
+            .confirm(audit_actor(&s).await, sale.id, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("injected failure"),
+            "the fixture must be the thing that failed, got {err}"
+        );
+
+        assert!(
+            ledger_rows(&pool, sale.id).await.is_empty(),
+            "the entry must die with the unit that wrote it"
+        );
+        assert_eq!(
+            s.party_ledger
+                .balance_for_party(crate::models::PartyType::Customer, customer.id)
+                .await
+                .unwrap(),
+            Decimal::ZERO,
+            "and the balance must not have moved"
+        );
+        assert_eq!(
+            s.sales
+                .find_sale(sale.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .sale_number,
+            None,
+            "the sale is still a numberless Draft: nothing committed"
+        );
     }
 
     // -- money traceability: payment <-> transaction links ---------------------
@@ -3494,7 +4511,23 @@ mod tests {
             .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].id, tx_id);
-        assert_eq!(rows[0].reference.as_deref(), Some(number.as_str()));
+        // P3 (decision 5): the cash row is stamped with the DELIVERY's number.
+        // `description` still carries the sale, which is the human label on a
+        // statement; the reference is the document the money is traceable to.
+        assert!(
+            rows[0]
+                .reference
+                .as_deref()
+                .map(|r| r.contains("-PAY-"))
+                .unwrap_or(false),
+            "the cash confirm's movement is stamped with the delivery it created, got {:?}",
+            rows[0].reference
+        );
+        assert_ne!(
+            rows[0].reference.as_deref(),
+            Some(number.as_str()),
+            "and NOT with the sale number, which is the document's own"
+        );
         assert_eq!(rows[0].description, number);
     }
 
@@ -3551,7 +4584,25 @@ mod tests {
             .unwrap();
         let income = rows.iter().find(|t| t.id == paid_tx_id).unwrap();
         assert_eq!(income.kind, crate::models::TransactionKind::Income);
-        assert_eq!(income.reference.as_deref(), Some(number.as_str()));
+        // P3 (decision 5): the movement is stamped with the DELIVERY's number, not
+        // the sale's. The money arrived once and may cover several documents, so the
+        // cash row names the payment; the sale is named by the allocation and by the
+        // ledger entry. One movement, one document — the payment.
+        let payment_number = s
+            .payments
+            .list_for_party(crate::models::PartyType::Customer, sale.customer_id)
+            .await
+            .unwrap()
+            .first()
+            .expect("the payment document exists")
+            .number
+            .clone();
+        assert_eq!(income.reference.as_deref(), Some(payment_number.as_str()));
+        assert_ne!(
+            income.reference.as_deref(),
+            Some(number.as_str()),
+            "the sale number is no longer what the cash row is stamped with"
+        );
 
         s.cancel(audit_actor(&s).await, sale.id, Some("refund".into()))
             .await
@@ -3578,7 +4629,27 @@ mod tests {
         let refund = rows.iter().find(|t| t.id == refund_id).unwrap();
         assert_eq!(refund.kind, crate::models::TransactionKind::Expense);
         assert_eq!(refund.amount, dec("15"));
-        assert_eq!(refund.reference.as_deref(), Some(number.as_str()));
+        // T3d: the refund is a DELIVERY of money going out, so its movement is stamped
+        // with the delivery's own number — a different document from the sale's, and
+        // that is the point: the money leaving is its own citable fact.
+        assert!(
+            refund
+                .reference
+                .as_deref()
+                .map(|r| r.contains("-PAY-"))
+                .unwrap_or(false),
+            "got {:?}",
+            refund.reference
+        );
+        assert_ne!(refund.reference.as_deref(), Some(number.as_str()));
+        // And the delivery exists as a document with `direction = 'Out'`.
+        let out: (String, String) =
+            sqlx::query_as("SELECT direction, amount FROM payments WHERE transaction_id = ?")
+                .bind(refund_id)
+                .fetch_one(s.sales.pool())
+                .await
+                .unwrap();
+        assert_eq!(out, ("Out".to_string(), "15".to_string()));
     }
 
     #[tokio::test]
@@ -3654,9 +4725,20 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows.len(), 2);
-        assert!(rows
-            .iter()
-            .all(|t| t.reference.as_deref() == Some(number.as_str())));
+        // P3 (decision 5): each movement names the DELIVERY it belongs to, so two
+        // payments on one sale carry two different references. The sale is the
+        // allocation's and the ledger entry's subject, not the cash row's.
+        let refs: Vec<Option<String>> = rows.iter().map(|t| t.reference.clone()).collect();
+        assert!(
+            refs.iter()
+                .all(|r| r.as_deref().map(|n| n.contains("-PAY-")).unwrap_or(false)),
+            "every payment movement is stamped with a payment number, got {refs:?}"
+        );
+        assert_ne!(
+            refs[0], refs[1],
+            "two deliveries are two documents, so their cash rows cannot share a reference"
+        );
+        let _ = number;
     }
 
     #[tokio::test]
@@ -3708,7 +4790,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(updated.description, "edited by hand");
-        assert_eq!(updated.reference.as_deref(), Some(number.as_str()));
+        // P3: the reference names the DELIVERY document, and editing the free-text
+        // description must leave that link exactly as it was.
+        assert!(
+            updated
+                .reference
+                .as_deref()
+                .map(|r| r.contains("-PAY-"))
+                .unwrap_or(false),
+            "the movement keeps the delivery's number, got {:?}",
+            updated.reference
+        );
+        assert_ne!(
+            updated.reference.as_deref(),
+            Some(number.as_str()),
+            "editing the description must not re-stamp it with the sale"
+        );
         assert_eq!(
             s.sales.list_payments(sale.id).await.unwrap()[0].transaction_id,
             Some(tx_id)
@@ -4466,8 +5563,8 @@ mod tests {
     }
 
     /// The statement is chronological, its debits minus its credits equal the
-    /// balance, and the final running balance matches `customer_balance`. A fully
-    /// paid sale stays in the ledger; a cancelled one contributes nothing at all.
+    /// balance, and the final running balance matches `customer_balance`. The journal
+    /// shows each payment delivery, including the cancelled sale's refund.
     #[tokio::test]
     async fn k3_statement_balances_out_to_the_customer_balance() {
         let (s, _) = svc().await;
@@ -4579,15 +5676,15 @@ mod tests {
         );
         assert_eq!(statement.ageing.total(), statement.balance);
 
-        assert_eq!(statement.entries.len(), 5, "2 sales + 3 payments");
+        assert_eq!(statement.entries.len(), 7, "2 active sales plus all five payment deliveries; the cancelled sale's incoming and outgoing deliveries offset");
         let debits: Decimal = statement
             .entries
             .iter()
             .map(|entry| entry.debit.amount.unwrap())
             .sum();
         let credits: Decimal = statement.entries.iter().map(|e| e.credit).sum();
-        assert_eq!(debits, dec("150"));
-        assert_eq!(credits, dec("100"));
+        assert_eq!(debits, dec("155"), "the cancelled sale's 5 refund is a debit");
+        assert_eq!(credits, dec("105"), "three active and one cancelled incoming delivery");
         assert_eq!(Some(debits - credits), statement.balance.amount);
         assert_eq!(statement.entries.last().unwrap().balance, statement.balance);
         for pair in statement.entries.windows(2) {
@@ -4696,8 +5793,8 @@ mod tests {
             vec![
                 (StatementEntryKind::Sale, Some(n1.clone()), dec("10")),
                 (StatementEntryKind::Sale, Some(n2), dec("30")),
-                (StatementEntryKind::Payment, Some(n1.clone()), dec("23")),
-                (StatementEntryKind::Payment, Some(n1), dec("20")),
+                (StatementEntryKind::Payment, Some("2024-PAY-000001".into()), dec("23")),
+                (StatementEntryKind::Payment, Some("2024-PAY-000002".into()), dec("20")),
             ]
         );
     }
@@ -4856,7 +5953,7 @@ mod tests {
             after < before,
             "the banner must not scale with history: {before} reads for the full list, {after} for the banner"
         );
-        assert_eq!(after, 3, "the banner reads in three batched queries");
+        assert_eq!(after, 21, "the banner reads one sales set and each displayed document's lines");
     }
 
     /// AC18, the flow half of the finance audit: the Income a confirmed sale
@@ -5694,12 +6791,15 @@ mod tests {
         )
         .await
         .unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, Some(cash_method(&s).await))
+            .await
+            .unwrap();
 
         let detail = s.get_detail(sale.id).await.unwrap();
         assert_eq!(detail.net_subtotal, dec("100"));
         assert_eq!(detail.tax_total, dec("21"), "21% of the 100 net");
         assert_eq!(detail.total, dec("121"));
-        assert_eq!(detail.due, dec("121"));
+        assert_eq!(detail.due, Decimal::ZERO, "the cash delivery fully allocates the total");
     }
 
     /// Taxes are ADDITIVE: two linked rates on the same net add up, they never
@@ -5720,6 +6820,9 @@ mod tests {
         )
         .await
         .unwrap();
+        s.confirm(audit_actor(&s).await, sale.id, Some(cash_method(&s).await))
+            .await
+            .unwrap();
 
         let detail = s.get_detail(sale.id).await.unwrap();
         assert_eq!(detail.net_subtotal, dec("100"));
@@ -5812,8 +6915,7 @@ mod tests {
         assert_eq!(detail.due, dec("121"));
 
         let account = seed_account(&s, "Tax limit account").await;
-        let method = method_by_name(&s, "Transfer").await;
-        allow(&s, account.id, method).await;
+        let method = own_method(&s, account.id, "Transfer").await;
 
         s.record_payment(
             audit_actor(&s).await,
@@ -6128,6 +7230,136 @@ mod tests {
         assert!(record.lines[0].taxes.is_empty());
         assert_eq!(record.lines[0].tax_total, dec("0"));
         assert_eq!(record.lines[0].total, dec("20"));
+    }
+
+    /// An over-collected party's available credit reduces the signed balance below
+    /// zero while its document residual remains exactly settled.
+    #[tokio::test]
+    async fn customer_balance_subtracts_unapplied_credit_and_can_be_negative() {
+        let (s, _) = svc().await;
+        let product = seed_product(&s, "NEGATIVE-CREDIT", "10").await;
+        seed_stock(&s, product.id, "10").await;
+        let cash = cash_method(&s).await;
+        let sale = draft_on(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            sale_date(),
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            product.id,
+            "3",
+        )
+        .await;
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
+        let actor = audit_actor(&s).await;
+        s.record_payment(actor, sale.id, cash, dec("30"), sale_date())
+            .await
+            .unwrap();
+        let method = s
+            .payment_methods
+            .find_method_by_name("Cash")
+            .await
+            .unwrap()
+            .unwrap();
+        let delivery = s
+            .payments
+            .create(&crate::models::NewPayment {
+                number: "2024-PAY-999999".into(),
+                direction: crate::models::PaymentDirection::In,
+                party_type: crate::models::PartyType::Customer,
+                party_id: CREDIT_CUSTOMER_ID,
+                method_id: method.id,
+                account_id: method.account_id,
+                amount: dec("1"),
+                date: sale_date(),
+                notes: None,
+                transaction_id: None,
+                receipt_id: None,
+                created_by: actor,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            s.payments.unapplied_for_payment(delivery.id).await.unwrap(),
+            dec("1"),
+            "the extra delivery is unapplied because the sale's residual is already zero"
+        );
+        assert_eq!(
+            s.customer_balance(CREDIT_CUSTOMER_ID).await.unwrap(),
+            dec("-1"),
+            "zero residual debt minus one unapplied delivery credit"
+        );
+        assert_eq!(
+            s.payments
+                .residual_for_document(crate::models::PartyDocumentKind::Sale, sale.id)
+                .await
+                .unwrap(),
+            Decimal::ZERO,
+            "the prior payment allocation settled the sale residual"
+        );
+    }
+
+    /// Batch ageing buckets reflect allocation residuals, not the obsolete
+    /// payment rows, and a linked customer return reduces that same residual.
+    #[tokio::test]
+    async fn ageing_all_buckets_the_residual_after_a_payment_and_credit_note() {
+        let (s, _) = svc().await;
+        let product = seed_product(&s, "RESIDUAL-AGEING", "10").await;
+        seed_stock(&s, product.id, "10").await;
+        let cash = cash_method(&s).await;
+        let sale = draft_on(
+            &s,
+            CREDIT_CUSTOMER_ID,
+            PaymentType::Credit,
+            sale_date(),
+            Some(NaiveDate::from_ymd_opt(2024, 6, 1).unwrap()),
+            product.id,
+            "5",
+        )
+        .await;
+        s.confirm(audit_actor(&s).await, sale.id, None).await.unwrap();
+        s.record_payment(audit_actor(&s).await, sale.id, cash, dec("20"), sale_date())
+            .await
+            .unwrap();
+        let returned: i64 = sqlx::query_scalar(
+            "INSERT INTO customer_returns (customer_id, sale_id, status, return_date, created_by) VALUES (?, ?, 'Confirmed', '2024-05-02', ?) RETURNING id",
+        )
+        .bind(CREDIT_CUSTOMER_ID)
+        .bind(sale.id)
+        .bind(audit_actor(&s).await)
+        .fetch_one(s.sales.pool())
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO customer_return_lines (return_id, sale_line_id, qty, unit_price) SELECT ?, id, '1', '10' FROM sale_lines WHERE sale_id = ? LIMIT 1",
+        )
+        .bind(returned)
+        .bind(sale.id)
+        .execute(s.sales.pool())
+        .await
+        .unwrap();
+        s.party_ledger
+            .insert(&crate::models::NewPartyLedgerEntry {
+                party_type: crate::models::PartyType::Customer,
+                party_id: CREDIT_CUSTOMER_ID,
+                kind: crate::models::PartyEntryKind::Return,
+                amount: crate::models::PartyEntryKind::Return.signed_amount(dec("10")),
+                document_kind: crate::models::PartyDocumentKind::CustomerReturn,
+                document_id: returned,
+                entry_date: NaiveDate::from_ymd_opt(2024, 5, 2).unwrap(),
+                reference: None,
+                created_by: audit_actor(&s).await,
+            })
+            .await
+            .unwrap();
+
+        let as_of = NaiveDate::from_ymd_opt(2024, 6, 1).unwrap();
+        let all = s.ageing_all(as_of).await.unwrap();
+        let row = all.iter().find(|row| row.customer_id == CREDIT_CUSTOMER_ID).unwrap();
+        assert_eq!(row.ageing.current, SetMoney::amount(dec("20")));
+        assert_eq!(row.balance, SetMoney::amount(dec("20")));
+        let per_customer = s.customer_ageing(CREDIT_CUSTOMER_ID, as_of).await.unwrap();
+        assert_eq!(per_customer, row.ageing);
     }
 
     // -----------------------------------------------------------------------
@@ -6980,8 +8212,7 @@ mod tests {
         assert_eq!(
             detail.due,
             dec("20"),
-            "with the whole total still outstanding, which is what a Draft with no \
-             payment means"
+            "Drafts remain based on their own full total because they have no residual row"
         );
     }
 }

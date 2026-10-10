@@ -667,6 +667,12 @@ mod tests {
         v.get("id").and_then(|x| x.as_i64()).unwrap()
     }
 
+    /// Find-or-create by name. Migration 45 seeds an account named `Caja`, and
+    /// these fixtures must not fail on `resource already exists` when a test
+    /// happens to ask for that name: the account the test wants is the seeded
+    /// one, and creating a second is neither possible nor intended.
+    /// Find-or-create by name (migration 45 seeds `Caja`; a fixture asking for
+    /// that name wants the seeded account, not a `resource already exists` 409).
     async fn seed_account(app: &axum::Router, name: &str) -> i64 {
         let (st, v) = post_json(
             app.clone(),
@@ -674,8 +680,19 @@ mod tests {
             serde_json::json!({ "name": name }),
         )
         .await;
-        assert_eq!(st, StatusCode::CREATED);
-        v.get("id").and_then(|x| x.as_i64()).unwrap()
+        if st == StatusCode::CREATED {
+            return v.get("id").and_then(|x| x.as_i64()).unwrap();
+        }
+        assert_eq!(st, StatusCode::CONFLICT, "seed account {name}: {v}");
+        let (_, list) = get_json(app.clone(), "/api/accounts").await;
+        list["accounts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|a| a["name"] == serde_json::json!(name))
+            .unwrap_or_else(|| panic!("account {name} exists but is not listed: {list}"))["id"]
+            .as_i64()
+            .unwrap()
     }
 
     /// A Cash purchase leaves the account, so with overdraft blocked the account

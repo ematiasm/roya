@@ -61,6 +61,15 @@ fn map_db_err(e: sqlx::Error) -> AppError {
 #[async_trait]
 pub trait CustomerReceiptRepository: Send + Sync {
     async fn create(&self, actor: i64, input: &NewReceipt) -> AppResult<CustomerReceipt>;
+    /// [`Self::create`] inside a transaction the CALLER owns. P3b needs it: the
+    /// receipt and the delivery of money it groups are ONE unit, so the grouping
+    /// document cannot survive without the money it groups.
+    async fn create_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        input: &NewReceipt,
+    ) -> AppResult<CustomerReceipt>;
     async fn find_by_id(&self, id: i64) -> AppResult<Option<CustomerReceipt>>;
     /// Receipts of one customer, oldest first (`date`, then id).
     async fn list_by_customer(&self, customer_id: i64) -> AppResult<Vec<CustomerReceipt>>;
@@ -122,6 +131,18 @@ impl SqliteCustomerReceiptRepository {
 #[async_trait]
 impl CustomerReceiptRepository for SqliteCustomerReceiptRepository {
     async fn create(&self, actor: i64, input: &NewReceipt) -> AppResult<CustomerReceipt> {
+        let mut tx = self.pool.begin().await?;
+        let created = self.create_in(&mut tx, actor, input).await?;
+        tx.commit().await?;
+        Ok(created)
+    }
+
+    async fn create_in(
+        &self,
+        tx: &mut sqlx::SqliteConnection,
+        actor: i64,
+        input: &NewReceipt,
+    ) -> AppResult<CustomerReceipt> {
         let row = sqlx::query(
             r#"INSERT INTO customer_receipts (customer_id, account_id, method_id, date, notes, created_by)
                VALUES (?, ?, ?, ?, ?, ?)
@@ -133,7 +154,7 @@ impl CustomerReceiptRepository for SqliteCustomerReceiptRepository {
         .bind(input.date)
         .bind(input.notes.clone())
         .bind(actor)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await
         .map_err(map_db_err)?;
         Ok(row_to_receipt(row))
@@ -286,6 +307,124 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::str::FromStr;
 
+    // -- migration 44: the (account_id, method_id) pair on a receipt is guarded
+    // by the schema. The refusals are proved with the raw statement and the
+    // trigger's own text; the full battery lives on sale_payments.
+
+    fn refusal_message(err: sqlx::Error) -> String {
+        match err {
+            sqlx::Error::Database(db) => db.message().to_string(),
+            other => panic!("expected a refused statement, got {other:?}"),
+        }
+    }
+
+    async fn owned_pair(pool: &SqlitePool, name: &str) -> (i64, i64) {
+        let actor = test_support::audit_actor_id(pool).await.unwrap();
+        let account: i64 = match sqlx::query_scalar("SELECT id FROM accounts WHERE name = ?")
+            .bind(name)
+            .fetch_optional(pool)
+            .await
+            .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO accounts (name, created_by) VALUES (?, ?) RETURNING id",
+            )
+            .bind(name)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
+        let method_name = format!("{name} cash");
+        let method: i64 = match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = ? AND account_id = ?",
+        )
+        .bind(&method_name)
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by) VALUES (?, ?, ?) RETURNING id",
+            )
+            .bind(&method_name)
+            .bind(account)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
+        (account, method)
+    }
+
+    async fn walkin_customer_id(pool: &SqlitePool) -> i64 {
+        let (id,): (i64,) = sqlx::query_as("SELECT id FROM customers WHERE is_walkin = 1")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn a_receipt_pairing_an_account_with_a_foreign_method_is_refused() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let customer = walkin_customer_id(&pool).await;
+        let (account, _method) = owned_pair(&pool, "wallet one").await;
+        let (_, foreign_method) = owned_pair(&pool, "wallet two").await;
+        let err = sqlx::query(
+            "INSERT INTO customer_receipts (customer_id, account_id, method_id, date, notes, created_by)\n             VALUES (?, ?, ?, '2024-06-01', NULL, ?)",
+        )
+        .bind(customer)
+        .bind(account)
+        .bind(foreign_method)
+        .bind(actor)
+        .execute(&pool)
+        .await
+        .unwrap_err();
+        assert_eq!(
+            refusal_message(err),
+            "the payment method does not belong to the named account"
+        );
+        let (rows,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM customer_receipts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "the refused row is not there");
+    }
+
+    #[tokio::test]
+    async fn a_receipt_with_a_consistent_pair_still_inserts() {
+        let pool = memory_pool().await;
+        let actor = test_support::audit_actor_id(&pool).await.unwrap();
+        let customer = walkin_customer_id(&pool).await;
+        let (account, method) = owned_pair(&pool, "wallet one").await;
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO customer_receipts (customer_id, account_id, method_id, date, notes, created_by)\n             VALUES (?, ?, ?, '2024-06-01', NULL, ?) RETURNING id",
+        )
+        .bind(customer)
+        .bind(account)
+        .bind(method)
+        .bind(actor)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let (stored_account, stored_method): (i64, i64) =
+            sqlx::query_as("SELECT account_id, method_id FROM customer_receipts WHERE id = ?")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            (stored_account, stored_method),
+            (account, method),
+            "the consistent pair was written"
+        );
+    }
+
     async fn memory_pool() -> SqlitePool {
         let opts = SqliteConnectOptions::from_str("sqlite::memory:")
             .unwrap()
@@ -322,15 +461,18 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        let (account_id,): (i64,) = sqlx::query_as(
-            "INSERT INTO accounts (name, created_by) VALUES ('Caja', ?) RETURNING id",
-        )
-        .bind(test_support::audit_actor_id(&pool).await.unwrap())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+        // Migration 45 SEEDS the account named Caja together with the Cash method
+        // it owns, so this fixture reuses that pair instead of inserting a second
+        // Caja (which UNIQUE(accounts.name) refuses). It is also the pair
+        // migration 44's guard accepts, which is what the receipt insert below
+        // needs.
+        let (account_id,): (i64,) = sqlx::query_as("SELECT id FROM accounts WHERE name = 'Caja'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         let (method_id,): (i64,) =
-            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
+            sqlx::query_as("SELECT id FROM payment_methods WHERE account_id = ? AND name = 'Cash'")
+                .bind(account_id)
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -410,11 +552,27 @@ mod tests {
                 .await
                 .unwrap(),
             };
-        let (method,): (i64,) =
-            sqlx::query_as("SELECT id FROM payment_methods WHERE name = 'Cash'")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        // Migration 44 guards the (account, method) pair on the receipt row,
+        // so the fixture needs a method THIS wallet owns (the seeded methods
+        // are unassigned on a fresh database).
+        let method: i64 = match sqlx::query_scalar(
+            "SELECT id FROM payment_methods WHERE name = 'doc wallet cash' AND account_id = ?",
+        )
+        .bind(account)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+        {
+            Some(id) => id,
+            None => sqlx::query_scalar(
+                "INSERT INTO payment_methods (name, account_id, created_by)\n                 VALUES ('doc wallet cash', ?, ?) RETURNING id",
+            )
+            .bind(account)
+            .bind(actor)
+            .fetch_one(pool)
+            .await
+            .unwrap(),
+        };
         (account, method)
     }
 

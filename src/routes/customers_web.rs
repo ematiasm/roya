@@ -989,7 +989,10 @@ mod tests {
     async fn seed_fixture(state: &AppState) -> WebFixture {
         let account = state
             .account_service
-            .create(audit_actor(&state).await, "Caja")
+            .create(
+                audit_actor(&state).await,
+                &format!("Caja {}", test_support::fixture_seq()),
+            )
             .await
             .unwrap();
         state
@@ -1003,7 +1006,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|m| m.name == "Cash")
+            .find(|m| m.name == "Cash" && m.account_id == account.id)
             .expect("Cash is seeded")
             .id;
         let product = state
@@ -1195,9 +1198,13 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         let method_options = html.split("name=\"method_id\"").nth(1).unwrap_or(&html);
         assert!(method_options.contains("Cash — Caja"), "{method_options}");
+        // There is no "— unassigned" option any more: migration 45 deleted the
+        // history-less leftovers and made ownership NOT NULL, so every option
+        // names an owner. What this test still guards is that the label is
+        // translated AND that the id in the option stays the canonical row id.
         assert!(
-            method_options.contains("Bank transfer — unassigned"),
-            "{method_options}"
+            !method_options.contains("unassigned"),
+            "no option may advertise an owner it does not have: {method_options}"
         );
         assert!(
             html.contains(&format!("value=\"{}\"", fixture.cash)),
@@ -1210,8 +1217,8 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert!(html.contains("Efectivo — Caja"), "{html:.1200}");
         assert!(
-            html.contains("Transferencia bancaria — sin asignar"),
-            "{html:.1200}"
+            !html.contains("sin asignar"),
+            "the Spanish catalog must not offer an ownerless method either: {html:.1200}"
         );
     }
 
@@ -1504,7 +1511,10 @@ mod tests {
             "derived balance after collecting: {html:.600}"
         );
 
-        // Over-collecting is refused and the refreshed list is untouched.
+        // **Over-collecting is ACCEPTED now (P3c) and creates a credit.** The form
+        // returns 200 and the customer ends up with a receipt whose `unapplied` is the
+        // difference; what the form must NOT do is apply more than the debt, so the
+        // sale's residual is asserted at zero rather than negative.
         let (status, body) = post_form(
             app.clone(),
             "/web/customer-receipts",
@@ -1514,16 +1524,34 @@ mod tests {
             ),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(status, StatusCode::OK, "{body}");
+
+        let receipts = state
+            .customer_receipt_service
+            .list_receipts(fixture.customer)
+            .await
+            .unwrap();
+        assert_eq!(receipts.len(), 2, "the collection was recorded");
+        let thousand = Decimal::from_str("1000").unwrap();
+        let credit = receipts
+            .iter()
+            .find(|r| r.total == thousand)
+            .expect("the second receipt is the 1000 one");
         assert_eq!(
-            state
-                .customer_receipt_service
-                .list_receipts(fixture.customer)
-                .await
-                .unwrap()
-                .len(),
-            1
+            credit.unapplied,
+            thousand - credit.applied,
+            "unapplied is the difference between what came in and what was applied"
         );
+        // The fixture owes 75 and the first collection applied 30, so 45 was still
+        // outstanding: the 1000 settles that remainder and the rest is credit. The
+        // figure that matters is that `applied` is capped by the DEBT, not by what was
+        // handed over — which is the share cap doing its job.
+        let forty_five = Decimal::from_str("45").unwrap();
+        assert_eq!(
+            credit.applied, forty_five,
+            "a share can only be as large as the debt it settles"
+        );
+        assert_eq!(credit.unapplied, thousand - forty_five);
     }
 
     #[tokio::test]

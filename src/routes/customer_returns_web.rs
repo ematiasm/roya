@@ -63,7 +63,7 @@ use crate::error::{AppError, AppResult};
 use crate::localization::LocalizationContext;
 use crate::models::{CustomerReturn, CustomerReturnStatus};
 use crate::repositories::customer_return_repo::CustomerReturnListFilter;
-use crate::repositories::CustomerReturnRepository;
+use crate::repositories::{CustomerReturnRepository, PaymentRepository};
 use crate::routes::{localized_refusal_error, AppState};
 use crate::security::authz::{Nav, Require, SalesCancel, SalesCreate, SalesRead};
 
@@ -629,7 +629,22 @@ async fn record_context(
     // call covers the payment table; a payment whose method or account is no longer
     // in that catalogue degrades to its id rather than failing the page.
     let methods = state.payment_method_service.methods_with_accounts().await?;
-    let refunds = detail
+    let deliveries = state
+        .customer_return_service
+        .payments
+        .list_refunds_for_document_tolerant(
+            crate::models::PartyDocumentKind::CustomerReturn,
+            detail.customer_return.id,
+        )
+        .await?;
+    if deliveries.unresolved_entries > 0 {
+        tracing::warn!(
+            document_id = detail.customer_return.id,
+            unresolved_entries = deliveries.unresolved_entries,
+            "some refund journal entries could not be resolved for the customer return page"
+        );
+    }
+    let refunds = deliveries
         .payments
         .iter()
         .map(|payment| {
@@ -638,7 +653,7 @@ async fn record_context(
                 id: payment.id,
                 date: payment.date,
                 account_name: method
-                    .and_then(|m| m.account_name.clone())
+                    .map(|m| m.account_name.clone())
                     .unwrap_or_else(|| payment.account_id.to_string()),
                 method_name: method.map(|m| m.name.clone()).unwrap_or_default(),
                 amount: payment.amount,
@@ -919,8 +934,8 @@ async fn web_confirm_customer_return(
     // and a malformed one must answer in the operator's language.
     let _form = form_or_refusal(form, &localization)?;
     // **No method field.** `confirm` resolves the refunds PER ORIGINATING ACCOUNT
-    // from the parent's payment rows, and `customer_return_payments` has no
-    // `payment_type` column (decision 7 of the design): a credit note's refunds are
+    // from the parent's payment rows, and the refund row this route used to keep
+    // had no `payment_type` column (decision 7 of the design): a credit note's refunds are
     // determined entirely by the parent's payments, so posting a second copy of
     // that flag would be a value that could disagree with the rows it summarizes.
     state
@@ -1321,7 +1336,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .find(|m| m.name == "Cash" && m.account_id == Some(account.id))
+            .find(|m| m.name == "Cash" && m.account_id == account.id)
             .expect("the default Cash method is now bound to the wallet account");
         // Fund it, so the sale's own collection and the note's refund both have a
         // real balance rather than a zero the guard would refuse against.
