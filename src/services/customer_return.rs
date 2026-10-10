@@ -177,16 +177,6 @@ where
 
     async fn detail_for(&self, customer_return: CustomerReturn) -> AppResult<CustomerReturnDetail> {
         let lines = self.returns.list_lines(customer_return.id).await?;
-        // Preserve the legacy model field until its type can move, but money is
-        // derived only from journal-backed refund deliveries.
-        //
-        // MEASURED: as of P5.3b-4 NO production consumer reads `detail.payments`
-        // any more — both routes build their refund rows from the journal, and no
-        // template mentions the field. Only tests still read it. So this legacy
-        // `list_payments` is now dead weight kept for the tests' sake, and it is
-        // the last thing tying `customer_return_payments` to a read: dropping the
-        // field (or re-expressing those tests against the journal) removes it.
-        let payments = self.returns.list_payments(customer_return.id).await?;
         let deliveries = self
             .payments
             .list_refunds_for_document_tolerant(
@@ -206,7 +196,6 @@ where
         Ok(CustomerReturnDetail {
             customer_return,
             lines,
-            payments,
             net_subtotal: money.net_subtotal,
             total: money.total,
             paid: money.paid,
@@ -978,8 +967,11 @@ where
         // refused for want of funds — which is what makes a credit note genuinely
         // reversible, where a purchase return's reversal can be refused because the shop
         // has already spent the refund it received.
-        // The legacy row remains the destination for its reversal link until the
-        // later write-side removal; the returned detail keeps that legacy model shape.
+        // The legacy row stays the destination for its reversal link until the
+        // write side goes too; that is the only reason the legacy read above is
+        // still here. Nothing else reads `detail.payments` since P5.3b-5 removed
+        // the field: the legacy read exists to pair a delivery with its legacy row
+        // so the reversal link can be written to it.
         for (pay, legacy_payment) in deliveries.iter().zip(&payments) {
             let reversal_delivery = crate::services::payment_writer::record_delivery_in(
                 &self.sequences,
@@ -1603,9 +1595,23 @@ mod tests {
             vec!["Income", "Expense"],
             "the parent's own collection was an Income; the refund is an Expense"
         );
+        // The refund delivery the journal resolves for this credit note is the one
+        // that claims the movement: the journal read is what replaced the legacy
+        // `detail.payments` row this used to inspect.
+        let delivery = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::CustomerReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the credit note has one refund delivery");
         let delivery_number: String =
             sqlx::query_scalar("SELECT number FROM payments WHERE transaction_id = ?")
-                .bind(detail.payments[0].transaction_id.unwrap())
+                .bind(delivery.transaction_id.unwrap())
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -1619,10 +1625,9 @@ mod tests {
             "the refund movement is not stamped with the parent's number"
         );
         assert_eq!(payment_count(&pool).await, 1);
-        assert_eq!(
-            detail.payments[0].transaction_id.is_some(),
-            true,
-            "the refund row claims the finance row it produced"
+        assert!(
+            delivery.transaction_id.is_some(),
+            "the refund delivery claims the finance row it produced"
         );
 
         // The number was taken in the return's own year under the short prefix,
@@ -2254,7 +2259,19 @@ mod tests {
             CustomerReturnStatus::Confirmed,
             "the goods still came back: an unpaid parent is not a reason to keep them"
         );
-        assert!(detail.payments.is_empty(), "there was nothing to refund");
+        // The journal resolves no refund delivery for this note, which is the same
+        // fact the legacy field used to carry: there was nothing to refund.
+        assert!(
+            s.payments
+                .list_refunds_for_document(
+                    crate::models::PartyDocumentKind::CustomerReturn,
+                    p.return_id,
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "there was nothing to refund"
+        );
         assert_eq!(payment_count(&pool).await, 0);
         assert_eq!(
             tx_count(&pool).await,
@@ -2354,12 +2371,18 @@ mod tests {
         let detail = s.confirm(who, credit_note.id).await.unwrap();
 
         assert_eq!(detail.total, dec("10"));
-        assert_eq!(
-            detail.payments.len(),
-            2,
-            "one refund per originating account"
-        );
-        let mut amounts: Vec<Decimal> = detail.payments.iter().map(|p| p.amount).collect();
+        // The split is read from the journal, which is where the deliveries live
+        // now: one refund per originating account.
+        let deliveries = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::CustomerReturn,
+                credit_note.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 2, "one refund per originating account");
+        let mut amounts: Vec<Decimal> = deliveries.iter().map(|p| p.amount).collect();
         amounts.sort();
         assert_eq!(amounts, vec![dec("4"), dec("6")]);
         assert_eq!(
@@ -3374,9 +3397,32 @@ mod tests {
             "the Expense the refund produced is now reversed by an Income, which \
              no overdraft guard can refuse"
         );
+        // "BOTH links" is now two journal facts, and both are asserted so neither
+        // half can rot: the refund delivery the journal resolves claims the
+        // movement it produced, AND the reversal it was answered by is recorded.
+        let refund_deliveries = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::CustomerReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(refund_deliveries.len(), 1);
         assert!(
-            detail.payments[0].refund_transaction_id.is_some(),
-            "the refund row carries BOTH links: the one it produced and the one that reverses it"
+            refund_deliveries[0].transaction_id.is_some(),
+            "the refund delivery claims the movement it produced"
+        );
+        assert_eq!(
+            s.payments
+                .count_reversals_for_document(
+                    crate::models::PartyDocumentKind::CustomerReturn,
+                    p.return_id,
+                )
+                .await
+                .unwrap(),
+            1,
+            "and the refund carries BOTH links: the one it produced and the one that reverses it"
         );
 
         match s.cancel(who, p.return_id, None).await.unwrap_err() {

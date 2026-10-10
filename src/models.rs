@@ -3410,7 +3410,6 @@ pub struct PurchaseReturnPayment {
 pub struct PurchaseReturnDetail {
     pub purchase_return: PurchaseReturn,
     pub lines: Vec<PurchaseReturnLine>,
-    pub payments: Vec<PurchaseReturnPayment>,
     /// `sum(line.subtotal())` — the money before tax, which here is all of it.
     pub net_subtotal: Decimal,
     /// The document total: the tax-inclusive figure, and with no frozen tax on a
@@ -3539,7 +3538,6 @@ pub struct CustomerReturnPayment {
 pub struct CustomerReturnDetail {
     pub customer_return: CustomerReturn,
     pub lines: Vec<CustomerReturnLine>,
-    pub payments: Vec<CustomerReturnPayment>,
     /// `sum(line.subtotal())` — the money before tax, which here is all of it.
     pub net_subtotal: Decimal,
     /// The document total: the tax-inclusive figure, and with no frozen tax on a
@@ -4386,7 +4384,6 @@ mod tests {
         let draft = PurchaseReturnDetail {
             purchase_return: purchase_return(PurchaseReturnStatus::Draft, None),
             lines: vec![purchase_return_line("3", "2.50")],
-            payments: vec![],
             net_subtotal: dec("7.50"),
             total: dec("7.50"),
             paid: dec("0"),
@@ -4399,7 +4396,6 @@ mod tests {
         assert_eq!(draft.purchase_return.return_number, None);
         assert_eq!(draft.purchase_return.purchase_id, 9);
         assert_eq!(draft.lines.len(), 1);
-        assert_eq!(draft.payments.len(), 0);
 
         // A return line freezes no tax, so there is nothing to separate: net and
         // total are the same figure, and both are the line's own subtotal.
@@ -4412,7 +4408,6 @@ mod tests {
                 PurchaseReturnStatus::Confirmed,
                 Some("2026-PRET-000001"),
             ),
-            payments: vec![purchase_return_payment(Some(31), None)],
             paid: dec("7.50"),
             due: dec("0"),
             payment_status: PaymentStatus::Paid,
@@ -4422,7 +4417,6 @@ mod tests {
             confirmed.purchase_return.return_number.as_deref(),
             Some("2026-PRET-000001")
         );
-        assert_eq!(confirmed.payments[0].transaction_id, Some(31));
         assert_eq!(confirmed.due, Decimal::ZERO);
     }
 
@@ -4436,7 +4430,6 @@ mod tests {
         let draft = CustomerReturnDetail {
             customer_return: customer_return(CustomerReturnStatus::Draft, None),
             lines: vec![customer_return_line("3", "2.50")],
-            payments: vec![],
             net_subtotal: dec("7.50"),
             total: dec("7.50"),
             paid: dec("0"),
@@ -4447,7 +4440,6 @@ mod tests {
         assert_eq!(draft.customer_return.credit_note_number, None);
         assert_eq!(draft.customer_return.sale_id, 9);
         assert_eq!(draft.lines.len(), 1);
-        assert_eq!(draft.payments.len(), 0);
         assert_eq!(draft.net_subtotal, draft.total);
         assert_eq!(draft.total, draft.lines[0].subtotal());
         assert_eq!(draft.due, draft.total - draft.paid);
@@ -4457,7 +4449,6 @@ mod tests {
                 CustomerReturnStatus::Confirmed,
                 Some("2026-SRET-000001"),
             ),
-            payments: vec![customer_return_payment(Some(31), None)],
             paid: dec("7.50"),
             due: dec("0"),
             payment_status: PaymentStatus::Paid,
@@ -4467,7 +4458,6 @@ mod tests {
             confirmed.customer_return.credit_note_number.as_deref(),
             Some("2026-SRET-000001")
         );
-        assert_eq!(confirmed.payments[0].transaction_id, Some(31));
         assert_eq!(confirmed.due, Decimal::ZERO);
     }
 

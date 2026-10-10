@@ -171,14 +171,6 @@ where
 
     async fn detail_for(&self, purchase_return: PurchaseReturn) -> AppResult<PurchaseReturnDetail> {
         let lines = self.returns.list_lines(purchase_return.id).await?;
-        // Preserve the legacy model field until its type can move, but money is
-        // derived only from journal-backed refund deliveries.
-        //
-        // MEASURED: as of P5.3b-4 NO production consumer reads `detail.payments`
-        // any more — both routes build their refund rows from the journal, and no
-        // template mentions the field. Only tests still read it, so this legacy
-        // `list_payments` is the last read tying `purchase_return_payments` in.
-        let payments = self.returns.list_payments(purchase_return.id).await?;
         let deliveries = self
             .payments
             .list_refunds_for_document_tolerant(
@@ -198,7 +190,6 @@ where
         Ok(PurchaseReturnDetail {
             purchase_return,
             lines,
-            payments,
             net_subtotal: money.net_subtotal,
             total: money.total,
             paid: money.paid,
@@ -1914,9 +1905,23 @@ mod tests {
             vec!["Expense", "Income"],
             "the parent's own payment was an Expense; the refund is an Income"
         );
+        // The refund delivery the journal resolves for this return is the one that
+        // claims the movement: the journal read replaced the legacy row this
+        // used to inspect.
+        let delivery = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap()
+            .into_iter()
+            .next()
+            .expect("the return has one refund delivery");
         let delivery_number: String =
             sqlx::query_scalar("SELECT number FROM payments WHERE transaction_id = ?")
-                .bind(detail.payments[0].transaction_id.unwrap())
+                .bind(delivery.transaction_id.unwrap())
                 .fetch_one(&pool)
                 .await
                 .unwrap();
@@ -1930,10 +1935,9 @@ mod tests {
             "the refund movement is not stamped with the parent's number"
         );
         assert_eq!(payment_count(&pool).await, 1);
-        assert_eq!(
-            detail.payments[0].transaction_id.is_some(),
-            true,
-            "the refund row claims the finance row it produced"
+        assert!(
+            delivery.transaction_id.is_some(),
+            "the refund delivery claims the finance row it produced"
         );
 
         // The number was taken in the return's own year under the short prefix.
@@ -2453,7 +2457,19 @@ mod tests {
             PurchaseReturnStatus::Confirmed,
             "the goods still went back: an unpaid parent is not a reason to keep them"
         );
-        assert!(detail.payments.is_empty(), "there was nothing to refund");
+        // The journal resolves no refund delivery for this note, which is the same
+        // fact the legacy field used to carry: there was nothing to refund.
+        assert!(
+            s.payments
+                .list_refunds_for_document(
+                    crate::models::PartyDocumentKind::PurchaseReturn,
+                    p.return_id,
+                )
+                .await
+                .unwrap()
+                .is_empty(),
+            "there was nothing to refund"
+        );
         assert_eq!(payment_count(&pool).await, 0);
         assert_eq!(
             tx_count(&pool).await,
@@ -2561,12 +2577,18 @@ mod tests {
         let detail = s.confirm(who, purchase_return.id).await.unwrap();
 
         assert_eq!(detail.total, dec("10"));
-        assert_eq!(
-            detail.payments.len(),
-            2,
-            "one refund per originating account"
-        );
-        let mut amounts: Vec<Decimal> = detail.payments.iter().map(|p| p.amount).collect();
+        // The split is read from the journal, which is where the deliveries live
+        // now: one refund per originating account.
+        let deliveries = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                purchase_return.id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(deliveries.len(), 2, "one refund per originating account");
+        let mut amounts: Vec<Decimal> = deliveries.iter().map(|p| p.amount).collect();
         amounts.sort();
         assert_eq!(amounts, vec![dec("4"), dec("6")]);
         assert_eq!(
@@ -3254,9 +3276,32 @@ mod tests {
             vec!["Expense", "Income", "Expense"],
             "the Income the refund produced is now reversed by an Expense"
         );
+        // "BOTH links" is now two journal facts, and both are asserted so neither
+        // half can rot: the refund delivery the journal resolves claims the
+        // movement it produced, AND the reversal it was answered by is recorded.
+        let refund_deliveries = s
+            .payments
+            .list_refunds_for_document(
+                crate::models::PartyDocumentKind::PurchaseReturn,
+                p.return_id,
+            )
+            .await
+            .unwrap();
+        assert_eq!(refund_deliveries.len(), 1);
         assert!(
-            detail.payments[0].refund_transaction_id.is_some(),
-            "the refund row carries BOTH links: the one it produced and the one that reverses it"
+            refund_deliveries[0].transaction_id.is_some(),
+            "the refund delivery claims the movement it produced"
+        );
+        assert_eq!(
+            s.payments
+                .count_reversals_for_document(
+                    crate::models::PartyDocumentKind::PurchaseReturn,
+                    p.return_id,
+                )
+                .await
+                .unwrap(),
+            1,
+            "and the refund carries BOTH links: the one it produced and the one that reverses it"
         );
 
         // A second cancel is refused rather than doubling the reversal.
