@@ -971,22 +971,45 @@ module starts at `customer_return_repo.rs:1086`), and `payment_account_and_metho
 
 ## P5.3b-3's mechanism, decided (measured 2026-10-09)
 
-The `cancel` refuses a partially-applied reversal by counting the legacy rows that link
-one (`customer_return.rs:848-856`, `p.refund_transaction_id.is_some()`). `payments` has no
-`refund_transaction_id`, and migration 19 gave that column to three legacy tables
-(`sale_payments`, `purchase_payments`, and the two return tables) with the same shape:
-`INTEGER NULL REFERENCES transactions(id) ON DELETE RESTRICT`.
+**First, a blocker b-2 hit and this document had already anticipated**: decision 9 requires
+a refund to REPLAY the parent payment's historical pair, and `trg_payments_method_account_insert`
+(migration 46, `:178`) refuses exactly that once the method has been re-pointed — so both
+`a_refund_replays_the_parent_payments_account_even_after_the_method_is_repointed` tests
+failed with SQLite error 1811 the moment the refunds started creating `payments` rows.
+That is the debt decision 9 names when it says "the refund out-payments must keep
+replaying the historical pair even when the method has since been re-pointed", and
+migration 44 already solved it once for the legacy tables (`:12-20`), whose reasoning is
+the template: a refund does not CHOOSE a pair, it REPLAYS the parent's, so a guard here
+aborts a valid operation.
 
-So the replacement is a column of the same name and shape on `payments`, added by
-migration 48, following the precedent migration 47 set for `receipt_id`: one nullable
-edge, `ON DELETE RESTRICT`, plus its index. That keeps the guard's MEANING (which refund
-of this document has already been given back) where the guard looks for it, and lets the
-legacy column go with its table.
+**Decision (user, 2026-10-09): migration 48 recreates that trigger with the exemption.**
+The exempt set is not a blanket hole and it is not arbitrary — it is the SAME pair-set
+`delivery_entry_kind` (`payment_writer.rs:31-44`) already uses, which is why the exemption
+has a shape instead of being a weakening:
 
-The alternative — deriving the link from the journal — was considered and rejected: the
-`Refund` entry the confirm writes and the `Payment` entry the cancel writes both carry
-`(document_kind, document_id)` for the return, but nothing distinguishes *which* refund
-delivery a given reversal answers, which is exactly the count the guard needs.
+| (party_type, direction) | what happens | the pair is |
+|---|---|---|
+| (Customer, In) | a collection | CHOSEN from the method |
+| (Supplier, Out) | a supplier payment | CHOSEN from the method |
+| **(Customer, Out)** | a refund to a customer | **REPLAYED from the parent** |
+| **(Supplier, In)** | a supplier refund | **REPLAYED from the parent** |
+
+The residual hole is the one migration 44 already accepted and named for the legacy
+tables. Migration 46 is never edited; migration 48 drops and recreates the trigger, the
+recreate pattern later migrations already use (`20240101000032:71-72`).
+
+**Then, the other half of this unit**: the `cancel` refuses a partially-applied reversal
+by counting the legacy rows that link one (`customer_return.rs:848-856`,
+`p.refund_transaction_id.is_some()`). `payments` has no `refund_transaction_id`, and
+migration 19 gave that column to the legacy tables with one shape: `INTEGER NULL
+REFERENCES transactions(id) ON DELETE RESTRICT`. The replacement is a column of the same
+name and shape on `payments`, added by migration 49, following the precedent migration 47
+set for `receipt_id`, plus its index.
+
+Deriving that link from the journal was considered and rejected: the `Refund` entry the
+confirm writes and the `Payment` entry the cancel writes both carry the return's
+`(document_kind, document_id)`, but nothing there says WHICH refund delivery a reversal
+answers, and that is the count the guard needs.
 
 ## Resume here
 
