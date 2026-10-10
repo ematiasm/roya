@@ -639,28 +639,37 @@ where
                 .await?;
         }
 
-        // 3 and 4. One Expense per planned refund, `reference` = this credit
-        //    note's own number, then the payment row that claims it. **An
-        //    Expense is money LEAVING**, so `create_with_reference_in` applies
-        //    the overdraft guard to each refund: a refund the shop cannot pay for
-        //    is refused rather than promised, and because the check is inside the
-        //    unit, the refusal takes the number and the movements back with it.
-        //    This is the one behavioural asymmetry with the purchase return,
-        //    where the refund is an Income and the guard never fires.
+        // 3. One refund delivery per planned amount. The shared writer creates
+        //    the Expense, the Out payment, and its Refund ledger entry in this
+        //    already-open unit. Expense remains money LEAVING, so its overdraft
+        //    guard still refuses a refund the shop cannot pay for. The payment
+        //    replays the parent's historical account/method, carries no
+        //    allocations, and names the credit note in its movement description;
+        //    its transaction reference is the delivery number by decision 5.
         for refund in &plan {
-            let expense = self
-                .transactions
-                .create_with_reference_in(
-                    &mut tx,
-                    actor,
-                    refund.account_id,
-                    crate::models::TransactionKind::Expense,
-                    refund.amount,
-                    Some(credit_note_number.clone()),
-                    Some(credit_note_number.clone()),
-                    customer_return.return_date,
-                )
-                .await?;
+            let delivery = crate::services::payment_writer::record_delivery_in(
+                &self.sequences,
+                &self.transactions,
+                &self.party_ledger,
+                &self.payments,
+                &mut tx,
+                actor,
+                crate::models::PaymentDirection::Out,
+                crate::models::PartyType::Customer,
+                sale.customer_id,
+                (crate::models::PartyDocumentKind::CustomerReturn, return_id),
+                refund.method_id,
+                refund.account_id,
+                refund.amount,
+                customer_return.return_date,
+                None,
+                Some(credit_note_number.clone()),
+                None,
+                &[],
+            )
+            .await?;
+            // Keep the legacy row until its cancel-path reads move. It shares
+            // this unit and points at the same movement as the new delivery.
             self.returns
                 .create_payment_in(
                     &mut tx,
@@ -670,29 +679,7 @@ where
                     refund.method_id,
                     refund.amount,
                     customer_return.return_date,
-                    Some(expense.id),
-                )
-                .await?;
-
-            // The money leg is a separate party obligation movement: one Refund
-            // per delivery, located on this return (not the parent payment). Its
-            // positive sign comes only from PartyEntryKind's rule; the account
-            // above remains the parent payment's historical account.
-            self.party_ledger
-                .insert_in(
-                    &mut tx,
-                    &crate::models::NewPartyLedgerEntry {
-                        party_type: crate::models::PartyType::Customer,
-                        party_id: sale.customer_id,
-                        kind: crate::models::PartyEntryKind::Refund,
-                        amount: crate::models::PartyEntryKind::Refund
-                            .signed_amount(refund.amount),
-                        document_kind: crate::models::PartyDocumentKind::CustomerReturn,
-                        document_id: return_id,
-                        entry_date: customer_return.return_date,
-                        reference: Some(credit_note_number.clone()),
-                        created_by: actor,
-                    },
+                    delivery.transaction_id,
                 )
                 .await?;
         }
@@ -998,6 +985,7 @@ where
     }
 }
 
+// Temporary rebuild trigger for the newly-added migration; removed after verification.
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1009,7 +997,7 @@ mod tests {
         SqliteSaleRepository, SqliteStockMovementRepository, SqliteTransactionRepository,
     };
     use crate::repositories::{
-        PartyLedgerRepository, PaymentRepository, SqlitePartyLedgerRepository,
+        PartyLedgerRepository, SqlitePartyLedgerRepository,
         SqlitePaymentRepository,
     };
     use crate::security::test_support;
@@ -1488,10 +1476,22 @@ mod tests {
             vec!["Income", "Expense"],
             "the parent's own collection was an Income; the refund is an Expense"
         );
+        let delivery_number: String = sqlx::query_scalar(
+            "SELECT number FROM payments WHERE transaction_id = ?",
+        )
+        .bind(detail.payments[0].transaction_id.unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
         assert_eq!(
             tx_references(&pool).await,
-            vec!["2024-SALE-MIRROR", "2024-SRET-000001"],
-            "the refund is stamped with the CREDIT NOTE's own number, not the parent's"
+            vec!["2024-SALE-MIRROR".to_string(), delivery_number.clone()],
+            "the reference names the delivery (decision 5); the credit note number is the movement description and Refund locator"
+        );
+        assert_ne!(
+            delivery_number,
+            "2024-SALE-MIRROR",
+            "the refund movement is not stamped with the parent's number"
         );
         assert_eq!(payment_count(&pool).await, 1);
         assert_eq!(
